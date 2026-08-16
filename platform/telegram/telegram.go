@@ -1317,10 +1317,14 @@ func buildTelegramKeyboard(buttons [][]core.ButtonOption) [][]models.InlineKeybo
 	for _, row := range buttons {
 		var btns []models.InlineKeyboardButton
 		for _, b := range row {
-			if b.CopyText != "" {
+			copyText := b.CopyText
+			if copyText == "" && strings.HasPrefix(b.Data, "copy:") {
+				copyText = strings.TrimPrefix(b.Data, "copy:")
+			}
+			if copyText != "" {
 				btns = append(btns, models.InlineKeyboardButton{
 					Text:     b.Text,
-					CopyText: &models.CopyTextButton{Text: b.CopyText},
+					CopyText: &models.CopyTextButton{Text: copyText},
 				})
 			} else {
 				btns = append(btns, models.InlineKeyboardButton{
