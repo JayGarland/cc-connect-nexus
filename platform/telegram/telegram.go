@@ -1312,6 +1312,28 @@ func telegramAudioFileExt(format string) string {
 	}
 }
 
+func buildTelegramKeyboard(buttons [][]core.ButtonOption) [][]models.InlineKeyboardButton {
+	var rows [][]models.InlineKeyboardButton
+	for _, row := range buttons {
+		var btns []models.InlineKeyboardButton
+		for _, b := range row {
+			if b.CopyText != "" {
+				btns = append(btns, models.InlineKeyboardButton{
+					Text:     b.Text,
+					CopyText: &models.CopyTextButton{Text: b.CopyText},
+				})
+			} else {
+				btns = append(btns, models.InlineKeyboardButton{
+					Text:         b.Text,
+					CallbackData: b.Data,
+				})
+			}
+		}
+		rows = append(rows, btns)
+	}
+	return rows
+}
+
 // SendWithButtons sends a message with an inline keyboard.
 func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string, buttons [][]core.ButtonOption) error {
 	rc, ok := rctx.(replyContext)
@@ -1323,13 +1345,21 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 		return err
 	}
 
-	var rows [][]models.InlineKeyboardButton
-	for _, row := range buttons {
-		var btns []models.InlineKeyboardButton
-		for _, b := range row {
-			btns = append(btns, models.InlineKeyboardButton{Text: b.Text, CallbackData: b.Data})
+	rows := buildTelegramKeyboard(buttons)
+	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+
+	if isEligibleRichMessage(content) {
+		richParams := &tgbot.SendRichMessageParams{
+			ChatID:          rc.chatID,
+			MessageThreadID: rc.threadID,
+			RichMessage:     models.InputRichMessage{Markdown: content},
+			ReplyMarkup:     markup,
 		}
-		rows = append(rows, btns)
+		if _, err := bot.SendRichMessage(ctx, richParams); err == nil {
+			return nil
+		} else {
+			slog.Warn("telegram: SendRichMessage SendWithButtons failed, falling back to HTML", "error", err)
+		}
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
@@ -1338,7 +1368,7 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 		MessageThreadID: rc.threadID,
 		Text:            html,
 		ParseMode:       models.ParseModeHTML,
-		ReplyMarkup:     &models.InlineKeyboardMarkup{InlineKeyboard: rows},
+		ReplyMarkup:     markup,
 	}
 
 	if _, err := bot.SendMessage(ctx, params); err != nil {
@@ -1365,6 +1395,75 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 		if err != nil {
 			return fmt.Errorf("telegram: sendWithButtons: %w", err)
 		}
+	}
+	return nil
+}
+
+// UpdateMessageWithButtons edits an existing message in-place and attaches inline keyboard buttons.
+func (p *Platform) UpdateMessageWithButtons(ctx context.Context, previewHandle any, content string, buttons [][]core.ButtonOption) error {
+	h, ok := previewHandle.(*telegramPreviewHandle)
+	if !ok {
+		return fmt.Errorf("telegram: invalid preview handle type %T", previewHandle)
+	}
+	if h.isDraft {
+		return p.UpdateMessage(ctx, previewHandle, content)
+	}
+
+	bot, err := p.connectedBot("update message with buttons")
+	if err != nil {
+		return err
+	}
+
+	rows := buildTelegramKeyboard(buttons)
+	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+
+	if isEligibleRichMessage(content) {
+		editParams := &tgbot.EditMessageTextParams{
+			ChatID:      h.chatID,
+			MessageID:   h.messageID,
+			Text:        "",
+			RichMessage: &models.InputRichMessage{Markdown: content},
+			ReplyMarkup: markup,
+		}
+		if _, err := bot.EditMessageText(ctx, editParams); err == nil {
+			return nil
+		} else {
+			slog.Debug("telegram: UpdateMessageWithButtons RichMessage failed, falling back to HTML", "error", err)
+		}
+	}
+
+	html := core.MarkdownToSimpleHTML(content)
+	params := &tgbot.EditMessageTextParams{
+		ChatID:      h.chatID,
+		MessageID:   h.messageID,
+		Text:        html,
+		ParseMode:   models.ParseModeHTML,
+		ReplyMarkup: markup,
+	}
+
+	if _, err := bot.EditMessageText(ctx, params); err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "not modified") {
+			return nil
+		}
+		if strings.Contains(errMsg, "can't parse") {
+			slog.Warn("telegram: HTML rejected by Telegram, editing as plain text",
+				"method", "UpdateMessageWithButtons",
+				"error", errMsg,
+				"html_prefix", truncateForLog(html, 200),
+				"html_len", len(html),
+			)
+			params.Text = content
+			params.ParseMode = ""
+			if _, err2 := bot.EditMessageText(ctx, params); err2 != nil {
+				if strings.Contains(err2.Error(), "not modified") {
+					return nil
+				}
+				return fmt.Errorf("telegram: edit message with buttons: %w", err2)
+			}
+			return nil
+		}
+		return fmt.Errorf("telegram: edit message with buttons: %w", err)
 	}
 	return nil
 }
@@ -1938,6 +2037,8 @@ func sanitizeTelegramCommand(cmd string) string {
 var (
 	_ core.AudioSender             = (*Platform)(nil)
 	_ core.MessageUpdater          = (*Platform)(nil)
+	_ core.MessageButtonUpdater    = (*Platform)(nil)
+	_ core.InlineButtonSender      = (*Platform)(nil)
 	_ core.PreviewStarter          = (*Platform)(nil)
 	_ core.PreviewCleaner          = (*Platform)(nil)
 	_ core.PreviewFinishPreference = (*Platform)(nil)

@@ -371,6 +371,9 @@ func TestPlatformDisconnectedSendPathsReturnNotConnected(t *testing.T) {
 		{name: "UpdateMessage", run: func() error {
 			return p.UpdateMessage(ctx, &telegramPreviewHandle{chatID: 1, messageID: 2}, "preview")
 		}},
+		{name: "UpdateMessageWithButtons", run: func() error {
+			return p.UpdateMessageWithButtons(ctx, &telegramPreviewHandle{chatID: 1, messageID: 2}, "preview", [][]core.ButtonOption{{{Text: "Copy", CopyText: "abc"}}})
+		}},
 		{name: "DeletePreviewMessage", run: func() error {
 			return p.DeletePreviewMessage(ctx, &telegramPreviewHandle{chatID: 1, messageID: 2})
 		}},

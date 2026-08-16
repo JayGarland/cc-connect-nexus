@@ -330,8 +330,9 @@ type ProgressUpdateThrottler interface {
 
 // ButtonOption represents a clickable inline button.
 type ButtonOption struct {
-	Text string // display text on the button
-	Data string // callback data returned when clicked (≤64 bytes for Telegram)
+	Text     string // display text on the button
+	Data     string // callback data returned when clicked (≤64 bytes for Telegram)
+	CopyText string // text to copy to clipboard when clicked (supported on Telegram CopyTextButton)
 }
 
 // InlineButtonSender is an optional interface for platforms that support
@@ -339,6 +340,12 @@ type ButtonOption struct {
 // Buttons is a 2D slice: each inner slice is one row of buttons.
 type InlineButtonSender interface {
 	SendWithButtons(ctx context.Context, replyCtx any, content string, buttons [][]ButtonOption) error
+}
+
+// MessageButtonUpdater is an optional interface for platforms that support
+// updating a message in place with clickable inline buttons.
+type MessageButtonUpdater interface {
+	UpdateMessageWithButtons(ctx context.Context, replyCtx any, content string, buttons [][]ButtonOption) error
 }
 
 // CardSender is an optional interface for platforms that support sending
