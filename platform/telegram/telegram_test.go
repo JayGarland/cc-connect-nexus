@@ -144,6 +144,34 @@ func (b *stubTelegramBot) SendAudio(_ context.Context, _ *tgbot.SendAudioParams)
 	return &models.Message{ID: 99}, nil
 }
 
+func (b *stubTelegramBot) SendRichMessage(_ context.Context, _ *tgbot.SendRichMessageParams) (*models.Message, error) {
+	b.mu.Lock()
+	b.sendMessageCalls++
+	b.mu.Unlock()
+	if b.sendErr != nil {
+		return nil, b.sendErr
+	}
+	return &models.Message{ID: 99}, nil
+}
+
+func (b *stubTelegramBot) SendMessageDraft(_ context.Context, _ *tgbot.SendMessageDraftParams) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sendErr != nil {
+		return false, b.sendErr
+	}
+	return true, nil
+}
+
+func (b *stubTelegramBot) SendRichMessageDraft(_ context.Context, _ *tgbot.SendRichMessageDraftParams) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sendErr != nil {
+		return false, b.sendErr
+	}
+	return true, nil
+}
+
 func (b *stubTelegramBot) SendChatAction(_ context.Context, _ *tgbot.SendChatActionParams) (bool, error) {
 	b.mu.Lock()
 	b.sendChatActionCalls++

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,20 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-var telegramConvertAudioToOpus = core.ConvertAudioToOpus
+var (
+	telegramConvertAudioToOpus = core.ConvertAudioToOpus
+	reTableSepLoose            = regexp.MustCompile(`(?m)^[ \t]*\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*:?-+:?[ \t]*\|?[ \t]*$`)
+)
+
+func isEligibleRichMessage(content string) bool {
+	if reTableSepLoose.MatchString(content) {
+		return true
+	}
+	if strings.Contains(content, "<tg-thinking>") || strings.Contains(content, "**>") {
+		return true
+	}
+	return false
+}
 
 func init() {
 	core.RegisterPlatform("telegram", New)
@@ -38,6 +52,9 @@ type replyContext struct {
 // *tgbot.Bot satisfies this interface.
 type telegramBot interface {
 	SendMessage(ctx context.Context, params *tgbot.SendMessageParams) (*models.Message, error)
+	SendRichMessage(ctx context.Context, params *tgbot.SendRichMessageParams) (*models.Message, error)
+	SendMessageDraft(ctx context.Context, params *tgbot.SendMessageDraftParams) (bool, error)
+	SendRichMessageDraft(ctx context.Context, params *tgbot.SendRichMessageDraftParams) (bool, error)
 	SendPhoto(ctx context.Context, params *tgbot.SendPhotoParams) (*models.Message, error)
 	SendDocument(ctx context.Context, params *tgbot.SendDocumentParams) (*models.Message, error)
 	SendVoice(ctx context.Context, params *tgbot.SendVoiceParams) (*models.Message, error)
@@ -1045,6 +1062,20 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return err
 	}
 
+	if isEligibleRichMessage(content) {
+		richParams := &tgbot.SendRichMessageParams{
+			ChatID:          rc.chatID,
+			MessageThreadID: rc.threadID,
+			RichMessage:     models.InputRichMessage{Markdown: content},
+			ReplyParameters: &models.ReplyParameters{MessageID: rc.messageID},
+		}
+		if _, err := bot.SendRichMessage(ctx, richParams); err == nil {
+			return nil
+		} else {
+			slog.Warn("telegram: SendRichMessage Reply failed, falling back to HTML", "error", err)
+		}
+	}
+
 	html := core.MarkdownToSimpleHTML(content)
 	params := &tgbot.SendMessageParams{
 		ChatID:          rc.chatID,
@@ -1091,6 +1122,19 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	bot, err := p.connectedBot("send")
 	if err != nil {
 		return err
+	}
+
+	if isEligibleRichMessage(content) {
+		richParams := &tgbot.SendRichMessageParams{
+			ChatID:          rc.chatID,
+			MessageThreadID: rc.threadID,
+			RichMessage:     models.InputRichMessage{Markdown: content},
+		}
+		if _, err := bot.SendRichMessage(ctx, richParams); err == nil {
+			return nil
+		} else {
+			slog.Warn("telegram: SendRichMessage Send failed, falling back to HTML", "error", err)
+		}
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
@@ -1325,7 +1369,7 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 	return nil
 }
 
-// DeletePreviewMessage deletes a stale preview message so the caller can send a fresh one.
+// DeletePreviewMessage deletes a stale preview message or clears a draft so the caller can send a fresh one.
 func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) error {
 	h, ok := previewHandle.(*telegramPreviewHandle)
 	if !ok {
@@ -1334,6 +1378,15 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) 
 	bot, err := p.connectedBot("delete preview")
 	if err != nil {
 		return err
+	}
+	if h.isDraft {
+		_, _ = bot.SendMessageDraft(ctx, &tgbot.SendMessageDraftParams{
+			ChatID:          h.chatID,
+			MessageThreadID: h.threadID,
+			DraftID:         strconv.Itoa(h.draftID),
+			Text:            "",
+		})
+		return nil
 	}
 	_, err = bot.DeleteMessage(ctx, &tgbot.DeleteMessageParams{ChatID: h.chatID, MessageID: h.messageID})
 	if err != nil {
@@ -1407,14 +1460,16 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	return replyContext{chatID: chatID, threadID: threadID}, nil
 }
 
-// telegramPreviewHandle stores the chat, thread, and message IDs for an editable preview message.
+// telegramPreviewHandle stores the chat, thread, message, and draft IDs for an editable preview or draft.
 type telegramPreviewHandle struct {
 	chatID    int64
 	threadID  int
 	messageID int
+	draftID   int
+	isDraft   bool
 }
 
-// SendPreviewStart sends a new message and returns a handle for subsequent edits.
+// SendPreviewStart sends a new message or starts a draft and returns a handle for subsequent edits.
 func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content string) (any, error) {
 	rc, ok := rctx.(replyContext)
 	if !ok {
@@ -1423,6 +1478,31 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	bot, err := p.connectedBot("send preview")
 	if err != nil {
 		return nil, err
+	}
+
+	// Private chat (chatID > 0): use native draft streaming
+	if rc.chatID > 0 {
+		draftID := int(time.Now().UnixNano() % 1000000)
+		var draftErr error
+		if isEligibleRichMessage(content) {
+			_, draftErr = bot.SendRichMessageDraft(ctx, &tgbot.SendRichMessageDraftParams{
+				ChatID:          rc.chatID,
+				MessageThreadID: rc.threadID,
+				DraftID:         draftID,
+				RichMessage:     models.InputRichMessage{Markdown: content},
+			})
+		} else {
+			_, draftErr = bot.SendMessageDraft(ctx, &tgbot.SendMessageDraftParams{
+				ChatID:          rc.chatID,
+				MessageThreadID: rc.threadID,
+				DraftID:         strconv.Itoa(draftID),
+				Text:            content,
+			})
+		}
+		if draftErr == nil {
+			return &telegramPreviewHandle{chatID: rc.chatID, threadID: rc.threadID, draftID: draftID, isDraft: true}, nil
+		}
+		slog.Debug("telegram: draft start failed, falling back to message preview", "error", draftErr)
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
@@ -1462,10 +1542,10 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 			return nil, fmt.Errorf("telegram: send preview: %w", err)
 		}
 	}
-	return &telegramPreviewHandle{chatID: rc.chatID, threadID: rc.threadID, messageID: sent.ID}, nil
+	return &telegramPreviewHandle{chatID: rc.chatID, threadID: rc.threadID, messageID: sent.ID, isDraft: false}, nil
 }
 
-// UpdateMessage edits an existing message identified by previewHandle.
+// UpdateMessage edits an existing message or updates a draft identified by previewHandle.
 func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content string) error {
 	h, ok := previewHandle.(*telegramPreviewHandle)
 	if !ok {
@@ -1474,6 +1554,45 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	bot, err := p.connectedBot("update message")
 	if err != nil {
 		return err
+	}
+
+	if h.isDraft {
+		if isEligibleRichMessage(content) {
+			_, err = bot.SendRichMessageDraft(ctx, &tgbot.SendRichMessageDraftParams{
+				ChatID:          h.chatID,
+				MessageThreadID: h.threadID,
+				DraftID:         h.draftID,
+				RichMessage:     models.InputRichMessage{Markdown: content},
+			})
+		} else {
+			_, err = bot.SendMessageDraft(ctx, &tgbot.SendMessageDraftParams{
+				ChatID:          h.chatID,
+				MessageThreadID: h.threadID,
+				DraftID:         strconv.Itoa(h.draftID),
+				Text:            content,
+			})
+		}
+		if err != nil {
+			slog.Debug("telegram: draft update failed", "error", err)
+		}
+		return err
+	}
+
+	// Group / Supergroup in-place message edit
+	if isEligibleRichMessage(content) {
+		editParams := &tgbot.EditMessageTextParams{
+			ChatID:    h.chatID,
+			MessageID: h.messageID,
+			Text:      "",
+			RichMessage: &models.InputRichMessage{
+				Markdown: content,
+			},
+		}
+		if _, err := bot.EditMessageText(ctx, editParams); err == nil {
+			return nil
+		} else {
+			slog.Debug("telegram: UpdateMessage RichMessage failed, falling back to HTML", "error", err)
+		}
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
@@ -1816,4 +1935,21 @@ func sanitizeTelegramCommand(cmd string) string {
 	return result
 }
 
-var _ core.AudioSender = (*Platform)(nil)
+var (
+	_ core.AudioSender             = (*Platform)(nil)
+	_ core.MessageUpdater          = (*Platform)(nil)
+	_ core.PreviewStarter          = (*Platform)(nil)
+	_ core.PreviewCleaner          = (*Platform)(nil)
+	_ core.PreviewFinishPreference = (*Platform)(nil)
+)
+
+func (p *Platform) KeepPreviewOnFinish() bool {
+	return true
+}
+
+func (p *Platform) KeepPreviewForHandle(previewHandle any) bool {
+	if h, ok := previewHandle.(*telegramPreviewHandle); ok {
+		return !h.isDraft
+	}
+	return true
+}

@@ -442,7 +442,9 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	}
 
 	keepPreview := false
-	if pref, ok := sp.platform.(PreviewFinishPreference); ok {
+	if checker, ok := sp.platform.(interface{ KeepPreviewForHandle(any) bool }); ok {
+		keepPreview = checker.KeepPreviewForHandle(sp.previewMsgID)
+	} else if pref, ok := sp.platform.(PreviewFinishPreference); ok {
 		keepPreview = pref.KeepPreviewOnFinish()
 	}
 
