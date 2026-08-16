@@ -28,6 +28,8 @@ github.com/JayGarland/nexus-connect v0.4.0 h1:1IOaWWYbxNirQIgI63WaM8Hb8NjCimJX3E
 github.com/JayGarland/nexus-connect v0.4.0/go.mod h1:RZWGW7QA0zxT7N0T0lI5+PHBIe7I25soJ8C3UkDEx1M=
 github.com/JayGarland/nexus-connect v0.5.0 h1:8bzkbqPNemwj4Wapq+s6SFjM1u0sbjWL2JnwVTe564c=
 github.com/JayGarland/nexus-connect v0.5.0/go.mod h1:RZWGW7QA0zxT7N0T0lI5+PHBIe7I25soJ8C3UkDEx1M=
+github.com/JayGarland/nexus-connect v0.5.1 h1:TRh59ibSDKpZALPduOJNuGuLE7YPtP/I7uPleIUSrL0=
+github.com/JayGarland/nexus-connect v0.5.1/go.mod h1:RZWGW7QA0zxT7N0T0lI5+PHBIe7I25soJ8C3UkDEx1M=
 github.com/aymanbagabas/go-osc52/v2 v2.0.1 h1:HwpRHbFMcZLEVr42D4p7XBqjyuxQH5SMiErDT4WkJ2k=
 github.com/aymanbagabas/go-osc52/v2 v2.0.1/go.mod h1:uYgXzlJ7ZpABp8OJ+exZzJJhRNQ2ASbcXHWsFqH8hp8=
 github.com/aymanbagabas/go-udiff v0.3.1 h1:LV+qyBQ2pqe0u42ZsUEtPiCaUoqgA9gYRDs3vj1nolY=
