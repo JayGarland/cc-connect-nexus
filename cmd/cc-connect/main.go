@@ -419,6 +419,11 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+		// Wire cron provider failover from project agent options:
+		//   provider            = primary provider each cron run resets to
+		//   fallback_providers  = ordered chain tried when a cron turn ends
+		//                         on a session-quota wall (empty = disabled)
+		wireProviderFailover(engine, proj.Agent)
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
 		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
@@ -1838,6 +1843,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		}
 	}
 
+	// Reload cron provider failover (primary reset + fallback chain)
+	wireProviderFailover(engine, proj.Agent)
+
 	// Reload custom commands
 	engine.ClearCommands("config")
 	for _, c := range cfg.Commands {
@@ -1938,8 +1946,12 @@ func buildAgentOptions(dataDir string, proj config.ProjectConfig) map[string]any
 	return opts
 }
 
-func wireAgentProviders(agent core.Agent, agentCfg config.AgentConfig) providerWiringResult {
-	result := providerWiringResult{canStartInitialRefresh: true}
+func wireProviderFailover(engine *core.Engine, agentCfg config.AgentConfig) {
+	primary, fallback := core.ParseProviderFailoverOptions(agentCfg.Options)
+	engine.SetProviderFailover(primary, fallback)
+}
+
+func wireAgentProviders(agent core.Agent, agentCfg config.AgentConfig) providerWiringResult {	result := providerWiringResult{canStartInitialRefresh: true}
 	active, _ := agentCfg.Options["provider"].(string)
 	result.explicitProviderRequested = active != ""
 

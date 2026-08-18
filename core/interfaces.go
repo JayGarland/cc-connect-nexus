@@ -474,6 +474,18 @@ type ProviderSwitcher interface {
 	ListProviders() []ProviderConfig
 }
 
+// SessionLimitDetector is an optional interface for agents that can recognize
+// when a turn ended because the backing provider hit a session/quota wall
+// (e.g. Claude Code's "You've hit your session limit") rather than with a
+// real reply. The engine consults it after a cron turn to decide whether a
+// provider failover retry is warranted.
+type SessionLimitDetector interface {
+	// IsSessionLimitEnding reports whether the given session's last assistant
+	// message is a session-quota wall termination. sessionID may be empty
+	// when the session produced no usable transcript.
+	IsSessionLimitEnding(ctx context.Context, sessionID string) (bool, error)
+}
+
 // MemoryFileProvider is an optional interface for agents that support
 // persistent instruction files (CLAUDE.md, AGENTS.md, GEMINI.md, etc.).
 // The engine uses these paths for the /memory command.
@@ -731,4 +743,11 @@ const (
 // updating the visual status of a preview card header.
 type PreviewStatusUpdater interface {
 	SetPreviewStatus(previewHandle any, status CardStatus)
+}
+
+// QuietSeparatorProvider is an optional interface for platforms that want to
+// customise the separator inserted between hidden thinking/tool boundaries
+// in quiet mode (e.g. "\n" instead of "\n\n").
+type QuietSeparatorProvider interface {
+	QuietSeparator() string
 }

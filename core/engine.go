@@ -351,6 +351,16 @@ type Engine struct {
 	listGlobalProvidersFunc func(agentType string) ([]ProviderConfig, error)
 	modelSaveFunc           func(model string) error
 
+	// primaryProvider is the provider name configured as the project's
+	// default; cron runs reset to it before each execution so a previous
+	// failover does not leak across runs. Empty means "leave the current
+	// provider as-is" (no reset).
+	primaryProvider string
+	// fallbackProviders is the ordered list of provider names to try when a
+	// cron turn ends on a session-quota wall. Empty means no automatic
+	// failover (default behavior).
+	fallbackProviders []string
+
 	ttsSaveFunc func(mode string) error
 
 	commandSaveAddFunc func(name, description, prompt, exec, workDir string) error
@@ -1038,6 +1048,39 @@ func (e *Engine) SetProviderRefsSaveFunc(fn func(refs []string) error) {
 	e.providerRefsSaveFunc = fn
 }
 
+// SetProviderFailover configures cron-turn provider failover: the primary
+// provider name cron runs reset to, and the ordered fallback chain to try
+// when a turn ends on a session-quota wall. Either may be empty to disable
+// that part of the mechanism.
+func (e *Engine) SetProviderFailover(primary string, fallback []string) {
+	e.primaryProvider = primary
+	e.fallbackProviders = append([]string(nil), fallback...)
+}
+
+// ParseProviderFailoverOptions extracts the primary provider and fallback
+// chain from agent option values, accepting []any, []string, or a single
+// string for the fallback list (config loader forms).
+func ParseProviderFailoverOptions(opts map[string]any) (primary string, fallback []string) {
+	if v, ok := opts["provider"].(string); ok {
+		primary = v
+	}
+	switch v := opts["fallback_providers"].(type) {
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				fallback = append(fallback, s)
+			}
+		}
+	case []string:
+		fallback = append(fallback, v...)
+	case string:
+		if v != "" {
+			fallback = append(fallback, v)
+		}
+	}
+	return primary, fallback
+}
+
 func (e *Engine) SetListGlobalProvidersFunc(fn func(agentType string) ([]ProviderConfig, error)) {
 	e.listGlobalProvidersFunc = fn
 }
@@ -1586,6 +1629,14 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 
 	if useNewSession {
 		msg.SessionKey = runSessionKey
+		// Reset to the configured primary provider before each cron run so a
+		// previous failover does not leak into this run. Unchanged behavior
+		// when no primary is configured.
+		if e.primaryProvider != "" {
+			if ps, ok := agent.(ProviderSwitcher); ok {
+				ps.SetActiveProvider(e.primaryProvider)
+			}
+		}
 		session := sessions.NewSideSession(runSessionKey, "cron-"+job.ID)
 		if !session.TryLock() {
 			return fmt.Errorf("session %q is busy", runSessionKey)
@@ -1596,15 +1647,27 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		}
 		prevHistLen := session.HistoryLen()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
-		e.cleanupInteractiveState(iKey)
 		// Empty-response detection via session history delta: processInteractiveMessageWith
 		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
 		// (prevHistLen+2). This approach correctly detects empty responses across all
 		// delivery modes (plain text, cards, rich cards, DingTalk AI streaming) because
 		// AddHistory("assistant",...) is called before any platform-specific rendering path.
 		if !job.Mute && session.HistoryLen() < prevHistLen+2 {
+			// A session-quota wall termination (e.g. Claude Code's
+			// "You've hit your session limit") produces exactly this empty
+			// assistant slot while doing no real work. When the agent can
+			// recognize it and a fallback provider is configured, fail over
+			// once: switch provider, run the same job in a fresh side
+			// session, and report the retry's outcome. cleanupInteractiveState
+			// runs after the failover attempt.
+			err := e.maybeFailoverCronTurn(job, effectivePlatform, msg, agent, sessions, runSessionKey, workspaceDir, session)
+			e.cleanupInteractiveState(iKey)
+			if err != nil {
+				return err
+			}
 			return fmt.Errorf("cron job %q produced an empty response", job.ID)
 		}
+		e.cleanupInteractiveState(iKey)
 		return nil
 	}
 
@@ -1622,6 +1685,95 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	// Same empty-response detection as the useNewSession path above.
 	if !job.Mute && session.HistoryLen() < prevHistLen+2 {
 		return fmt.Errorf("cron job %q produced an empty response", job.ID)
+	}
+	return nil
+}
+
+// maybeFailoverCronTurn handles the case where a new-per-run cron turn ended
+// without an assistant reply. If the agent recognizes the termination as a
+// session-quota wall and a fallback provider chain is configured, it switches
+// to the next provider and re-runs the same job in a fresh side session.
+//
+// Return semantics:
+//   - nil: no failover happened (not a limit wall, no fallback configured, or
+//     no usable agent session id) — the caller reports the empty-response error;
+//   - non-nil error: a failover was attempted and the retry also ended empty
+//     (or the retry session could not be created) — the caller returns this.
+//
+// At most one failover happens per turn; success or a second wall both stop
+// here (no unbounded retry loop).
+func (e *Engine) maybeFailoverCronTurn(job *CronJob, effectivePlatform Platform, msg *Message, agent Agent, sessions *SessionManager, runSessionKey, workspaceDir string, failedSession *Session) error {
+	if len(e.fallbackProviders) == 0 {
+		return nil
+	}
+	detector, okDet := agent.(SessionLimitDetector)
+	if !okDet {
+		return nil
+	}
+	switcher, okSw := agent.(ProviderSwitcher)
+	if !okSw {
+		return nil
+	}
+
+	// The failed turn's agent session id is read from the Session row — it is
+	// written back from the agent's CurrentSessionID() at spawn (and at each
+	// fork), so it survives the agent process exiting on the quota wall.
+	agentSessionID := failedSession.GetAgentSessionID()
+	if agentSessionID == "" {
+		return nil
+	}
+
+	limitHit, err := detector.IsSessionLimitEnding(context.Background(), agentSessionID)
+	if err != nil {
+		slog.Warn("cron: session-limit detection failed, skipping failover",
+			"job", job.ID, "session", runSessionKey, "error", err)
+		return nil
+	}
+	if !limitHit {
+		return nil
+	}
+
+	// Choose the next provider in the fallback chain, skipping the one the
+	// failed run used (both to avoid re-hitting the same wall and to keep
+	// the chain idempotent).
+	current := ""
+	if cur := switcher.GetActiveProvider(); cur != nil {
+		current = cur.Name
+	}
+	next := ""
+	for _, name := range e.fallbackProviders {
+		if name != current {
+			next = name
+			break
+		}
+	}
+	if next == "" {
+		return nil
+	}
+
+	slog.Warn("cron: provider failover after session-limit wall",
+		"job", job.ID, "from", current, "to", next, "session", runSessionKey)
+	if !switcher.SetActiveProvider(next) {
+		slog.Warn("cron: failover provider not found, skipping",
+			"job", job.ID, "provider", next)
+		return nil
+	}
+
+	retrySession := sessions.NewSideSession(runSessionKey, "cron-"+job.ID+"-failover")
+	if !retrySession.TryLock() {
+		slog.Warn("cron: failover retry session busy", "job", job.ID, "session", runSessionKey)
+		return fmt.Errorf("cron job %q: failover retry session busy", job.ID)
+	}
+	retryIKey := fmt.Sprintf("%s#cron:%s", runSessionKey, retrySession.ID)
+	if workspaceDir != "" {
+		retryIKey = workspaceDir + ":" + retryIKey
+	}
+	prevHistLen := retrySession.HistoryLen()
+	e.processInteractiveMessageWith(effectivePlatform, msg, retrySession, agent, sessions, retryIKey, workspaceDir, runSessionKey)
+	e.cleanupInteractiveState(retryIKey)
+
+	if !job.Mute && retrySession.HistoryLen() < prevHistLen+2 {
+		return fmt.Errorf("cron job %q produced an empty response after provider failover to %q", job.ID, next)
 	}
 	return nil
 }
@@ -5007,9 +5159,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			//   compact: freeze+detach to split text into separate cards
 			if !e.display.ThinkingMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
-					if sp.canPreview() && sp.appendSeparator("\n\n") {
-						textParts = append(textParts, "\n\n")
+					sep := quietSeparator(p)
+					if sp.canPreview() && sp.appendSeparator(sep) {
+						textParts = append(textParts, sep)
 					}
+					segmentStart = len(textParts)
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
@@ -5094,9 +5248,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			//   compact: freeze+detach to split text into separate cards
 			if !e.display.ToolMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
-					if sp.canPreview() && sp.appendSeparator("\n\n") {
-						textParts = append(textParts, "\n\n")
+					sep := quietSeparator(p)
+					if sp.canPreview() && sp.appendSeparator(sep) {
+						textParts = append(textParts, sep)
 					}
+					segmentStart = len(textParts)
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
@@ -16967,4 +17123,15 @@ func restoreActiveProviderFromSession(agent Agent, session *Session) {
 	}
 	slog.Info("restored active provider from session",
 		"session_id", session.ID, "provider", want)
+}
+
+// quietSeparator resolves the separator used in quiet mode between thinking/tool
+// boundaries. Defaults to "\n\n" unless the platform implements QuietSeparatorProvider.
+func quietSeparator(p Platform) string {
+	if qp, ok := p.(QuietSeparatorProvider); ok {
+		if sep := qp.QuietSeparator(); sep != "" {
+			return sep
+		}
+	}
+	return "\n\n"
 }
