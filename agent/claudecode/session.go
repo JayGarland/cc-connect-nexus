@@ -690,8 +690,13 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 		}
 	}
 
-	contentArr, ok := msg["content"].([]any)
-	if !ok {
+	var contentArr []any
+	switch c := msg["content"].(type) {
+	case []any:
+		contentArr = c
+	case map[string]any:
+		contentArr = []any{c}
+	default:
 		return
 	}
 	for _, contentItem := range contentArr {

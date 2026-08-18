@@ -29,6 +29,9 @@ var (
 )
 
 func isEligibleRichMessage(content string) bool {
+	if utf8.RuneCountInString(content) > telegramMaxMessageLen {
+		return false
+	}
 	if reTableSepLoose.MatchString(content) {
 		return true
 	}
@@ -1052,6 +1055,106 @@ func isCommand(msg *models.Message) bool {
 	return false
 }
 
+func (p *Platform) sendSingleChunk(ctx context.Context, bot telegramBot, rc replyContext, chunk string, isReply bool, markup *models.InlineKeyboardMarkup) error {
+	var replyMarkup models.ReplyMarkup
+	if markup != nil {
+		replyMarkup = markup
+	}
+
+	if isEligibleRichMessage(chunk) {
+		richParams := &tgbot.SendRichMessageParams{
+			ChatID:          rc.chatID,
+			MessageThreadID: rc.threadID,
+			RichMessage:     models.InputRichMessage{Markdown: chunk},
+			ReplyMarkup:     replyMarkup,
+		}
+		if isReply && rc.messageID > 0 {
+			richParams.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
+		}
+		if _, err := bot.SendRichMessage(ctx, richParams); err == nil {
+			return nil
+		} else {
+			slog.Warn("telegram: SendRichMessage failed, falling back to HTML", "error", err)
+		}
+	}
+
+	html := core.MarkdownToSimpleHTML(chunk)
+	if utf8.RuneCountInString(html) <= telegramMaxMessageLen {
+		params := &tgbot.SendMessageParams{
+			ChatID:          rc.chatID,
+			MessageThreadID: rc.threadID,
+			Text:            html,
+			ParseMode:       models.ParseModeHTML,
+			ReplyMarkup:     replyMarkup,
+		}
+		if isReply && rc.messageID > 0 {
+			params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
+		}
+		if _, err := bot.SendMessage(ctx, params); err == nil {
+			return nil
+		} else {
+			slog.Warn("telegram: HTML send failed, falling back to plain text", "error", err)
+		}
+	}
+
+	// Plain text fallback (safe against HTML parsing errors & tag expansion)
+	if utf8.RuneCountInString(chunk) > telegramMaxMessageLen {
+		subChunks := core.SplitMessageCodeFenceAware(chunk, telegramMaxMessageLen)
+		for i, sc := range subChunks {
+			params := &tgbot.SendMessageParams{
+				ChatID:          rc.chatID,
+				MessageThreadID: rc.threadID,
+				Text:            sc,
+				ParseMode:       "",
+			}
+			if i == 0 {
+				if isReply && rc.messageID > 0 {
+					params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
+				}
+				params.ReplyMarkup = replyMarkup
+			}
+			if _, err := bot.SendMessage(ctx, params); err != nil {
+				return fmt.Errorf("telegram: send plain subchunk %d: %w", i, err)
+			}
+		}
+		return nil
+	}
+
+	params := &tgbot.SendMessageParams{
+		ChatID:          rc.chatID,
+		MessageThreadID: rc.threadID,
+		Text:            chunk,
+		ParseMode:       "",
+		ReplyMarkup:     replyMarkup,
+	}
+	if isReply && rc.messageID > 0 {
+		params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
+	}
+	if _, err := bot.SendMessage(ctx, params); err != nil {
+		return fmt.Errorf("telegram: send plain text: %w", err)
+	}
+	return nil
+}
+
+func (p *Platform) sendMarkdownContent(ctx context.Context, bot telegramBot, rc replyContext, content string, isReply bool, markup *models.InlineKeyboardMarkup) error {
+	if utf8.RuneCountInString(content) <= telegramMaxMessageLen {
+		return p.sendSingleChunk(ctx, bot, rc, content, isReply, markup)
+	}
+
+	chunks := core.SplitMessageCodeFenceAware(content, telegramMaxMessageLen)
+	for i, chunk := range chunks {
+		isReplyChunk := isReply && (i == 0)
+		var chunkMarkup *models.InlineKeyboardMarkup
+		if i == 0 {
+			chunkMarkup = markup
+		}
+		if err := p.sendSingleChunk(ctx, bot, rc, chunk, isReplyChunk, chunkMarkup); err != nil {
+			return fmt.Errorf("telegram: send chunk %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
@@ -1061,56 +1164,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	if err != nil {
 		return err
 	}
-
-	if isEligibleRichMessage(content) {
-		richParams := &tgbot.SendRichMessageParams{
-			ChatID:          rc.chatID,
-			MessageThreadID: rc.threadID,
-			RichMessage:     models.InputRichMessage{Markdown: content},
-			ReplyParameters: &models.ReplyParameters{MessageID: rc.messageID},
-		}
-		if _, err := bot.SendRichMessage(ctx, richParams); err == nil {
-			return nil
-		} else {
-			slog.Warn("telegram: SendRichMessage Reply failed, falling back to HTML", "error", err)
-		}
-	}
-
-	html := core.MarkdownToSimpleHTML(content)
-	params := &tgbot.SendMessageParams{
-		ChatID:          rc.chatID,
-		MessageThreadID: rc.threadID,
-		Text:            html,
-		ParseMode:       models.ParseModeHTML,
-		ReplyParameters: &models.ReplyParameters{MessageID: rc.messageID},
-	}
-
-	if _, err := bot.SendMessage(ctx, params); err != nil {
-		errMsg := err.Error()
-		// Handle HTML parsing errors by falling back to plain text
-		if strings.Contains(errMsg, "can't parse") {
-			slog.Warn("telegram: HTML rejected by Telegram, sending as plain text",
-				"method", "Reply",
-				"error", errMsg,
-				"html_prefix", truncateForLog(html, 200),
-				"html_len", len(html),
-			)
-			params.Text = content
-			params.ParseMode = ""
-			_, err = bot.SendMessage(ctx, params)
-		} else if strings.Contains(errMsg, "message is too long") {
-			// Handle message too long by splitting and sending as multiple messages
-			slog.Warn("telegram: message too long, splitting into chunks",
-				"method", "Reply",
-				"html_len", len(html),
-			)
-			return p.sendChunked(ctx, bot, rc, html)
-		}
-		if err != nil {
-			return fmt.Errorf("telegram: send: %w", err)
-		}
-	}
-	return nil
+	return p.sendMarkdownContent(ctx, bot, rc, content, true, nil)
 }
 
 // Send sends a new message (not a reply)
@@ -1123,54 +1177,7 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	if err != nil {
 		return err
 	}
-
-	if isEligibleRichMessage(content) {
-		richParams := &tgbot.SendRichMessageParams{
-			ChatID:          rc.chatID,
-			MessageThreadID: rc.threadID,
-			RichMessage:     models.InputRichMessage{Markdown: content},
-		}
-		if _, err := bot.SendRichMessage(ctx, richParams); err == nil {
-			return nil
-		} else {
-			slog.Warn("telegram: SendRichMessage Send failed, falling back to HTML", "error", err)
-		}
-	}
-
-	html := core.MarkdownToSimpleHTML(content)
-	params := &tgbot.SendMessageParams{
-		ChatID:          rc.chatID,
-		MessageThreadID: rc.threadID,
-		Text:            html,
-		ParseMode:       models.ParseModeHTML,
-	}
-
-	if _, err := bot.SendMessage(ctx, params); err != nil {
-		errMsg := err.Error()
-		// Handle HTML parsing errors by falling back to plain text
-		if strings.Contains(errMsg, "can't parse") {
-			slog.Warn("telegram: HTML rejected by Telegram, sending as plain text",
-				"method", "Send",
-				"error", errMsg,
-				"html_prefix", truncateForLog(html, 200),
-				"html_len", len(html),
-			)
-			params.Text = content
-			params.ParseMode = ""
-			_, err = bot.SendMessage(ctx, params)
-		} else if strings.Contains(errMsg, "message is too long") {
-			// Handle message too long by splitting and sending as multiple messages
-			slog.Warn("telegram: message too long, splitting into chunks",
-				"method", "Send",
-				"html_len", len(html),
-			)
-			return p.sendChunked(ctx, bot, rc, html)
-		}
-		if err != nil {
-			return fmt.Errorf("telegram: send: %w", err)
-		}
-	}
-	return nil
+	return p.sendMarkdownContent(ctx, bot, rc, content, false, nil)
 }
 
 func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttachment) error {
@@ -1351,56 +1358,7 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 
 	rows := buildTelegramKeyboard(buttons)
 	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
-
-	if isEligibleRichMessage(content) {
-		richParams := &tgbot.SendRichMessageParams{
-			ChatID:          rc.chatID,
-			MessageThreadID: rc.threadID,
-			RichMessage:     models.InputRichMessage{Markdown: content},
-			ReplyMarkup:     markup,
-		}
-		if _, err := bot.SendRichMessage(ctx, richParams); err == nil {
-			return nil
-		} else {
-			slog.Warn("telegram: SendRichMessage SendWithButtons failed, falling back to HTML", "error", err)
-		}
-	}
-
-	html := core.MarkdownToSimpleHTML(content)
-	params := &tgbot.SendMessageParams{
-		ChatID:          rc.chatID,
-		MessageThreadID: rc.threadID,
-		Text:            html,
-		ParseMode:       models.ParseModeHTML,
-		ReplyMarkup:     markup,
-	}
-
-	if _, err := bot.SendMessage(ctx, params); err != nil {
-		errMsg := err.Error()
-		// Handle HTML parsing errors by falling back to plain text
-		if strings.Contains(errMsg, "can't parse") {
-			slog.Warn("telegram: HTML rejected by Telegram, sending as plain text",
-				"method", "SendWithButtons",
-				"error", errMsg,
-				"html_prefix", truncateForLog(html, 200),
-				"html_len", len(html),
-			)
-			params.Text = content
-			params.ParseMode = ""
-			_, err = bot.SendMessage(ctx, params)
-		} else if strings.Contains(errMsg, "message is too long") {
-			// Handle message too long: first chunk with buttons, rest without
-			slog.Warn("telegram: message too long, splitting into chunks",
-				"method", "SendWithButtons",
-				"html_len", len(html),
-			)
-			return p.sendChunkedWithButtons(ctx, bot, rc, html, rows)
-		}
-		if err != nil {
-			return fmt.Errorf("telegram: sendWithButtons: %w", err)
-		}
-	}
-	return nil
+	return p.sendMarkdownContent(ctx, bot, rc, content, false, markup)
 }
 
 // UpdateMessageWithButtons edits an existing message in-place and attaches inline keyboard buttons.
@@ -1419,7 +1377,10 @@ func (p *Platform) UpdateMessageWithButtons(ctx context.Context, previewHandle a
 	}
 
 	rows := buildTelegramKeyboard(buttons)
-	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+	var replyMarkup models.ReplyMarkup
+	if len(rows) > 0 {
+		replyMarkup = &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+	}
 
 	if isEligibleRichMessage(content) {
 		editParams := &tgbot.EditMessageTextParams{
@@ -1427,7 +1388,7 @@ func (p *Platform) UpdateMessageWithButtons(ctx context.Context, previewHandle a
 			MessageID:   h.messageID,
 			Text:        "",
 			RichMessage: &models.InputRichMessage{Markdown: content},
-			ReplyMarkup: markup,
+			ReplyMarkup: replyMarkup,
 		}
 		if _, err := bot.EditMessageText(ctx, editParams); err == nil {
 			return nil
@@ -1437,34 +1398,38 @@ func (p *Platform) UpdateMessageWithButtons(ctx context.Context, previewHandle a
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
+	if utf8.RuneCountInString(html) <= telegramMaxMessageLen {
+		params := &tgbot.EditMessageTextParams{
+			ChatID:      h.chatID,
+			MessageID:   h.messageID,
+			Text:        html,
+			ParseMode:   models.ParseModeHTML,
+			ReplyMarkup: replyMarkup,
+		}
+		if _, err := bot.EditMessageText(ctx, params); err == nil {
+			return nil
+		} else {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "not modified") {
+				return nil
+			}
+			slog.Debug("telegram: UpdateMessageWithButtons HTML failed, falling back to plain text", "error", errMsg)
+		}
+	}
+
+	plainText := content
+	if utf8.RuneCountInString(plainText) > telegramMaxMessageLen {
+		plainText = string([]rune(plainText)[:telegramMaxMessageLen-1]) + "…"
+	}
 	params := &tgbot.EditMessageTextParams{
 		ChatID:      h.chatID,
 		MessageID:   h.messageID,
-		Text:        html,
-		ParseMode:   models.ParseModeHTML,
-		ReplyMarkup: markup,
+		Text:        plainText,
+		ParseMode:   "",
+		ReplyMarkup: replyMarkup,
 	}
-
 	if _, err := bot.EditMessageText(ctx, params); err != nil {
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "not modified") {
-			return nil
-		}
-		if strings.Contains(errMsg, "can't parse") {
-			slog.Warn("telegram: HTML rejected by Telegram, editing as plain text",
-				"method", "UpdateMessageWithButtons",
-				"error", errMsg,
-				"html_prefix", truncateForLog(html, 200),
-				"html_len", len(html),
-			)
-			params.Text = content
-			params.ParseMode = ""
-			if _, err2 := bot.EditMessageText(ctx, params); err2 != nil {
-				if strings.Contains(err2.Error(), "not modified") {
-					return nil
-				}
-				return fmt.Errorf("telegram: edit message with buttons: %w", err2)
-			}
+		if strings.Contains(err.Error(), "not modified") {
 			return nil
 		}
 		return fmt.Errorf("telegram: edit message with buttons: %w", err)
@@ -1483,12 +1448,21 @@ func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) 
 		return err
 	}
 	if h.isDraft {
-		_, _ = bot.SendMessageDraft(ctx, &tgbot.SendMessageDraftParams{
+		_, err1 := bot.SendMessageDraft(ctx, &tgbot.SendMessageDraftParams{
 			ChatID:          h.chatID,
 			MessageThreadID: h.threadID,
 			DraftID:         strconv.Itoa(h.draftID),
 			Text:            "",
 		})
+		_, err2 := bot.SendRichMessageDraft(ctx, &tgbot.SendRichMessageDraftParams{
+			ChatID:          h.chatID,
+			MessageThreadID: h.threadID,
+			DraftID:         h.draftID,
+			RichMessage:     models.InputRichMessage{Markdown: ""},
+		})
+		if err1 != nil && err2 != nil {
+			slog.Debug("telegram: delete draft failed", "err1", err1, "err2", err2)
+		}
 		return nil
 	}
 	_, err = bot.DeleteMessage(ctx, &tgbot.DeleteMessageParams{ChatID: h.chatID, MessageID: h.messageID})
@@ -1699,44 +1673,47 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	}
 
 	html := core.MarkdownToSimpleHTML(content)
-	slog.Debug("telegram: UpdateMessage",
-		"content_len", len(content), "html_len", len(html),
-		"content_prefix", truncateForLog(content, 80),
-		"html_prefix", truncateForLog(html, 80))
+	if utf8.RuneCountInString(html) <= telegramMaxMessageLen {
+		slog.Debug("telegram: UpdateMessage",
+			"content_len", len(content), "html_len", len(html),
+			"content_prefix", truncateForLog(content, 80),
+			"html_prefix", truncateForLog(html, 80))
 
+		params := &tgbot.EditMessageTextParams{
+			ChatID:    h.chatID,
+			MessageID: h.messageID,
+			Text:      html,
+			ParseMode: models.ParseModeHTML,
+		}
+
+		if _, err := bot.EditMessageText(ctx, params); err == nil {
+			slog.Debug("telegram: UpdateMessage HTML success")
+			return nil
+		} else {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "not modified") {
+				return nil
+			}
+			slog.Debug("telegram: UpdateMessage HTML failed, falling back to plain text", "error", errMsg)
+		}
+	}
+
+	plainText := content
+	if utf8.RuneCountInString(plainText) > telegramMaxMessageLen {
+		plainText = string([]rune(plainText)[:telegramMaxMessageLen-1]) + "…"
+	}
 	params := &tgbot.EditMessageTextParams{
 		ChatID:    h.chatID,
 		MessageID: h.messageID,
-		Text:      html,
-		ParseMode: models.ParseModeHTML,
+		Text:      plainText,
+		ParseMode: "",
 	}
-
 	if _, err := bot.EditMessageText(ctx, params); err != nil {
-		errMsg := err.Error()
-		slog.Debug("telegram: UpdateMessage HTML failed", "error", errMsg)
-		if strings.Contains(errMsg, "not modified") {
-			return nil
-		}
-		if strings.Contains(errMsg, "can't parse") {
-			slog.Warn("telegram: HTML rejected by Telegram, editing as plain text",
-				"method", "UpdateMessage",
-				"error", errMsg,
-				"html_prefix", truncateForLog(html, 200),
-				"html_len", len(html),
-			)
-			params.Text = content
-			params.ParseMode = ""
-			if _, err2 := bot.EditMessageText(ctx, params); err2 != nil {
-				if strings.Contains(err2.Error(), "not modified") {
-					return nil
-				}
-				return fmt.Errorf("telegram: edit message: %w", err2)
-			}
+		if strings.Contains(err.Error(), "not modified") {
 			return nil
 		}
 		return fmt.Errorf("telegram: edit message: %w", err)
 	}
-	slog.Debug("telegram: UpdateMessage HTML success")
 	return nil
 }
 
@@ -1745,64 +1722,18 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 const telegramMaxMessageLen = 4096
 
 // sendChunked splits a message that's too long and sends it as multiple messages.
-// It uses SplitMessageCodeFenceAware to respect code block boundaries.
-func (p *Platform) sendChunked(ctx context.Context, bot telegramBot, rc replyContext, html string) error {
-	chunks := core.SplitMessageCodeFenceAware(html, telegramMaxMessageLen)
-	for i, chunk := range chunks {
-		params := &tgbot.SendMessageParams{
-			ChatID:          rc.chatID,
-			MessageThreadID: rc.threadID,
-			Text:            chunk,
-			ParseMode:       models.ParseModeHTML,
-		}
-		if i == 0 && rc.messageID != 0 {
-			params.ReplyParameters = &models.ReplyParameters{MessageID: rc.messageID}
-		}
-		if _, err := bot.SendMessage(ctx, params); err != nil {
-			// If HTML fails, try plain text
-			if strings.Contains(err.Error(), "can't parse") {
-				params.Text = chunk
-				params.ParseMode = ""
-				if _, err2 := bot.SendMessage(ctx, params); err2 != nil {
-					return fmt.Errorf("telegram: send chunk %d: %w", i, err2)
-				}
-			} else {
-				return fmt.Errorf("telegram: send chunk %d: %w", i, err)
-			}
-		}
-	}
-	return nil
+func (p *Platform) sendChunked(ctx context.Context, bot telegramBot, rc replyContext, content string) error {
+	return p.sendMarkdownContent(ctx, bot, rc, content, rc.messageID != 0, nil)
 }
 
 // sendChunkedWithButtons splits a message that's too long and sends it as multiple messages.
 // The first chunk includes the inline keyboard buttons.
-func (p *Platform) sendChunkedWithButtons(ctx context.Context, bot telegramBot, rc replyContext, html string, rows [][]models.InlineKeyboardButton) error {
-	chunks := core.SplitMessageCodeFenceAware(html, telegramMaxMessageLen)
-	for i, chunk := range chunks {
-		params := &tgbot.SendMessageParams{
-			ChatID:          rc.chatID,
-			MessageThreadID: rc.threadID,
-			Text:            chunk,
-			ParseMode:       models.ParseModeHTML,
-		}
-		// Only first chunk gets the buttons
-		if i == 0 {
-			params.ReplyMarkup = &models.InlineKeyboardMarkup{InlineKeyboard: rows}
-		}
-		if _, err := bot.SendMessage(ctx, params); err != nil {
-			// If HTML fails, try plain text
-			if strings.Contains(err.Error(), "can't parse") {
-				params.Text = chunk
-				params.ParseMode = ""
-				if _, err2 := bot.SendMessage(ctx, params); err2 != nil {
-					return fmt.Errorf("telegram: send chunk %d: %w", i, err2)
-				}
-			} else {
-				return fmt.Errorf("telegram: send chunk %d: %w", i, err)
-			}
-		}
+func (p *Platform) sendChunkedWithButtons(ctx context.Context, bot telegramBot, rc replyContext, content string, rows [][]models.InlineKeyboardButton) error {
+	var markup *models.InlineKeyboardMarkup
+	if len(rows) > 0 {
+		markup = &models.InlineKeyboardMarkup{InlineKeyboard: rows}
 	}
-	return nil
+	return p.sendMarkdownContent(ctx, bot, rc, content, false, markup)
 }
 
 // StartTyping sends a "typing…" chat action and repeats every 5 seconds
@@ -2057,4 +1988,11 @@ func (p *Platform) KeepPreviewForHandle(previewHandle any) bool {
 		return !h.isDraft
 	}
 	return true
+}
+
+func (p *Platform) DeferPreviewCleanup(previewHandle any) bool {
+	if h, ok := previewHandle.(*telegramPreviewHandle); ok {
+		return h.isDraft
+	}
+	return false
 }

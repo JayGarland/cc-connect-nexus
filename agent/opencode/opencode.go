@@ -725,3 +725,20 @@ func querySessionTitle(sessionID string) string {
 	title := strings.TrimSpace(string(out))
 	return title
 }
+
+// IsSessionLimitEnding implements core.SessionLimitDetector for OpenCode.
+func (a *Agent) IsSessionLimitEnding(_ context.Context, _, content string) (bool, error) {
+	text := strings.TrimSpace(content)
+	if text == "" || len(text) > 300 || strings.Contains(text, "```") {
+		return false, nil
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "usage limit") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "quota exceeded") ||
+		strings.Contains(lower, "daily limit") ||
+		strings.Contains(lower, "credit limit") {
+		return true, nil
+	}
+	return false, nil
+}

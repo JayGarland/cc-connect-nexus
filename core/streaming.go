@@ -432,7 +432,11 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 					}
 				}
 			}
-			if cleaner, ok := sp.platform.(PreviewCleaner); ok {
+			deferCleanup := false
+			if d, ok := sp.platform.(interface{ DeferPreviewCleanup(any) bool }); ok {
+				deferCleanup = d.DeferPreviewCleanup(sp.previewMsgID)
+			}
+			if cleaner, ok := sp.platform.(PreviewCleaner); ok && !deferCleanup {
 				slog.Debug("stream preview finish: deleting stale preview (degraded)")
 				_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
 			}
@@ -448,10 +452,19 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 		keepPreview = pref.KeepPreviewOnFinish()
 	}
 
+	deferCleanup := false
+	if d, ok := sp.platform.(interface{ DeferPreviewCleanup(any) bool }); ok {
+		deferCleanup = d.DeferPreviewCleanup(sp.previewMsgID)
+	}
+
 	// If platform wants to delete the preview and send fresh, let it.
 	if cleaner, ok := sp.platform.(PreviewCleaner); ok && !keepPreview {
-		slog.Debug("stream preview finish: deleting preview (PreviewCleaner)")
-		_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
+		if !deferCleanup {
+			slog.Debug("stream preview finish: deleting preview (PreviewCleaner)")
+			_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
+		} else {
+			slog.Debug("stream preview finish: deferring preview cleanup (DeferPreviewCleanup)")
+		}
 		return false
 	}
 
@@ -506,12 +519,7 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	}
 
 	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText); err != nil {
-		slog.Debug("stream preview finish: final update FAILED, cleaning up preview", "error", err)
-		// Update failed (e.g. text too long for platform edit API).
-		// Try to delete the stale preview so caller can send a fresh message.
-		if cleaner, ok := sp.platform.(PreviewCleaner); ok {
-			_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
-		}
+		slog.Debug("stream preview finish: final update failed, returning false for caller fallback send", "error", err)
 		return false
 	}
 	if sp.pendingStatus != "" {
@@ -547,6 +555,21 @@ func (sp *streamPreview) detachPreview() {
 	sp.previewMsgID = nil
 }
 
+// cleanupPreview explicitly deletes any active preview message or draft.
+// Called by the engine after successfully delivering the final response via
+// non-preview send paths.
+func (sp *streamPreview) cleanupPreview() {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.previewMsgID != nil {
+		if cleaner, ok := sp.platform.(PreviewCleaner); ok {
+			slog.Debug("stream preview cleanup: deleting preview handle")
+			_ = cleaner.DeletePreviewMessage(sp.ctx, sp.previewMsgID)
+		}
+		sp.previewMsgID = nil
+	}
+}
+
 // appendSeparator inserts a paragraph break into the accumulated text without
 // triggering a flush. Used in quiet mode to visually separate text segments
 // that span thinking/tool boundaries without creating separate messages.
@@ -555,6 +578,9 @@ func (sp *streamPreview) appendSeparator(sep string) bool {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	if sp.degraded || !sp.cfg.Enabled || sp.fullText == "" {
+		return false
+	}
+	if strings.HasSuffix(sp.fullText, sep) {
 		return false
 	}
 	sp.fullText += sep

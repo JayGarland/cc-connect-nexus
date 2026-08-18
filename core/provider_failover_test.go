@@ -42,7 +42,7 @@ func (a *failoverStubAgent) GetActiveProvider() *ProviderConfig {
 
 func (a *failoverStubAgent) ListProviders() []ProviderConfig { return a.providers }
 
-func (a *failoverStubAgent) IsSessionLimitEnding(_ context.Context, _ string) (bool, error) {
+func (a *failoverStubAgent) IsSessionLimitEnding(_ context.Context, _, _ string) (bool, error) {
 	a.limitChecked++
 	return a.limitHit, nil
 }
@@ -121,6 +121,76 @@ func TestCronProviderFailover(t *testing.T) {
 	}
 	if agent.switchCalls[len(agent.switchCalls)-1] != "fallback1" {
 		t.Fatalf("last switch = %q, want %q", agent.switchCalls[len(agent.switchCalls)-1], "fallback1")
+	}
+}
+
+type fakeSuccessSession struct {
+	stubAgentSession
+	events chan Event
+}
+
+func (s *fakeSuccessSession) Send(_ string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	go func() {
+		s.events <- Event{Type: EventText, Content: "Cron turn completed successfully on fallback"}
+		s.events <- Event{Type: EventResult, Content: "Cron turn completed successfully on fallback", Done: true}
+	}()
+	return nil
+}
+
+func (s *fakeSuccessSession) Events() <-chan Event { return s.events }
+func (s *fakeSuccessSession) CurrentSessionID() string { return "fake-success-session" }
+
+type fakeSuccessOnRetryAgent struct {
+	failoverStubAgent
+	sessionCount int
+}
+
+func (a *fakeSuccessOnRetryAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	a.sessionCount++
+	if a.sessionCount == 1 {
+		return &fakeCronAgentSession{}, nil
+	}
+	return &fakeSuccessSession{events: make(chan Event, 2)}, nil
+}
+
+// TestCronProviderFailoverSuccess verifies that when the primary turn hits a
+// session limit wall and the fallback retry produces a non-empty assistant
+// reply, ExecuteCronJob returns nil (success).
+func TestCronProviderFailoverSuccess(t *testing.T) {
+	agent := &fakeSuccessOnRetryAgent{
+		failoverStubAgent: failoverStubAgent{
+			providers: []ProviderConfig{
+				{Name: "primary"},
+				{Name: "fallback1"},
+			},
+			activeIdx: 0,
+			limitHit:  true,
+		},
+	}
+	eng := NewEngine("test", agent, []Platform{&stubCronReplyTargetPlatform{stubPlatformEngine: stubPlatformEngine{n: "stub"}}}, "", LangEnglish)
+	eng.SetProviderFailover("primary", []string{"fallback1"})
+
+	job := &CronJob{
+		ID:         "test-cron-success",
+		Project:    "test",
+		SessionKey: "stub:p:u",
+		Prompt:     "Standing Participation v1 scheduled check.",
+		Enabled:    true,
+	}
+	job.SessionMode = "new_per_run"
+
+	err := eng.ExecuteCronJob(job)
+	if err != nil {
+		t.Fatalf("expected nil error on successful fallback retry, got: %v", err)
+	}
+	if agent.sessionCount != 2 {
+		t.Fatalf("expected 2 sessions (primary + retry), got %d", agent.sessionCount)
+	}
+	if len(agent.switchCalls) < 2 {
+		t.Fatalf("expected at least 2 switch calls, got %v", agent.switchCalls)
+	}
+	if agent.switchCalls[len(agent.switchCalls)-1] != "fallback1" {
+		t.Fatalf("expected last switch to fallback1, got %q", agent.switchCalls[len(agent.switchCalls)-1])
 	}
 }
 

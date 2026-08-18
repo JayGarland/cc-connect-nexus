@@ -1662,13 +1662,12 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		// session, and report the retry's outcome. cleanupInteractiveState
 		// runs after the failover attempt.
 		if !job.Mute {
-			empty := session.HistoryLen() < prevHistLen+2
-			err := e.maybeFailoverCronTurn(job, effectivePlatform, msg, agent, sessions, runSessionKey, workspaceDir, session)
+			handled, failoverErr := e.maybeFailoverCronTurn(job, effectivePlatform, msg, agent, sessions, runSessionKey, workspaceDir, session)
 			e.cleanupInteractiveState(iKey)
-			if err != nil {
-				return err
+			if handled {
+				return failoverErr
 			}
-			if empty {
+			if session.HistoryLen() < prevHistLen+2 {
 				return fmt.Errorf("cron job %q produced an empty response", job.ID)
 			}
 			return nil
@@ -1695,48 +1694,45 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	return nil
 }
 
-// maybeFailoverCronTurn handles the case where a new-per-run cron turn ended
-// without an assistant reply. If the agent recognizes the termination as a
-// session-quota wall and a fallback provider chain is configured, it switches
-// to the next provider and re-runs the same job in a fresh side session.
+// maybeFailoverCronTurn handles the case where a new-per-run cron turn ended on
+// a session-quota wall. When the agent recognizes the termination as a quota
+// wall:
+//   - If fallback providers are configured, it switches to the next provider and
+//     re-runs the job in a fresh side session, returning (true, nil) on success
+//     or (true, error) on retry failure.
+//   - If no fallback providers are configured or available, it returns
+//     (true, error) reporting the session limit termination explicitly.
 //
-// Return semantics:
-//   - nil: no failover happened (not a limit wall, no fallback configured, or
-//     no usable agent session id) — the caller reports the empty-response error;
-//   - non-nil error: a failover was attempted and the retry also ended empty
-//     (or the retry session could not be created) — the caller returns this.
-//
-// At most one failover happens per turn; success or a second wall both stop
-// here (no unbounded retry loop).
-func (e *Engine) maybeFailoverCronTurn(job *CronJob, effectivePlatform Platform, msg *Message, agent Agent, sessions *SessionManager, runSessionKey, workspaceDir string, failedSession *Session) error {
-	if len(e.fallbackProviders) == 0 {
-		return nil
-	}
+// If the turn was not a session-quota wall, it returns (false, nil).
+func (e *Engine) maybeFailoverCronTurn(job *CronJob, effectivePlatform Platform, msg *Message, agent Agent, sessions *SessionManager, runSessionKey, workspaceDir string, failedSession *Session) (bool, error) {
 	detector, okDet := agent.(SessionLimitDetector)
 	if !okDet {
-		return nil
-	}
-	switcher, okSw := agent.(ProviderSwitcher)
-	if !okSw {
-		return nil
+		return false, nil
 	}
 
 	// The failed turn's agent session id is read from the Session row — it is
 	// written back from the agent's CurrentSessionID() at spawn (and at each
 	// fork), so it survives the agent process exiting on the quota wall.
 	agentSessionID := failedSession.GetAgentSessionID()
-	if agentSessionID == "" {
-		return nil
-	}
+	lastAssistant := failedSession.GetLastAssistantContent()
 
-	limitHit, err := detector.IsSessionLimitEnding(context.Background(), agentSessionID)
+	limitHit, err := detector.IsSessionLimitEnding(context.Background(), agentSessionID, lastAssistant)
 	if err != nil {
 		slog.Warn("cron: session-limit detection failed, skipping failover",
 			"job", job.ID, "session", runSessionKey, "error", err)
-		return nil
+		return false, nil
 	}
 	if !limitHit {
-		return nil
+		return false, nil
+	}
+
+	if len(e.fallbackProviders) == 0 {
+		return true, fmt.Errorf("cron job %q hit session limit with no fallback provider configured", job.ID)
+	}
+
+	switcher, okSw := agent.(ProviderSwitcher)
+	if !okSw {
+		return true, fmt.Errorf("cron job %q hit session limit but agent does not support provider switching", job.ID)
 	}
 
 	// Choose the next provider in the fallback chain, skipping the one the
@@ -1754,7 +1750,7 @@ func (e *Engine) maybeFailoverCronTurn(job *CronJob, effectivePlatform Platform,
 		}
 	}
 	if next == "" {
-		return nil
+		return true, fmt.Errorf("cron job %q hit session limit and exhausted fallback providers", job.ID)
 	}
 
 	slog.Warn("cron: provider failover after session-limit wall",
@@ -1762,13 +1758,13 @@ func (e *Engine) maybeFailoverCronTurn(job *CronJob, effectivePlatform Platform,
 	if !switcher.SetActiveProvider(next) {
 		slog.Warn("cron: failover provider not found, skipping",
 			"job", job.ID, "provider", next)
-		return nil
+		return true, fmt.Errorf("cron job %q: failover provider %q not found", job.ID, next)
 	}
 
 	retrySession := sessions.NewSideSession(runSessionKey, "cron-"+job.ID+"-failover")
 	if !retrySession.TryLock() {
 		slog.Warn("cron: failover retry session busy", "job", job.ID, "session", runSessionKey)
-		return fmt.Errorf("cron job %q: failover retry session busy", job.ID)
+		return true, fmt.Errorf("cron job %q: failover retry session busy", job.ID)
 	}
 	retryIKey := fmt.Sprintf("%s#cron:%s", runSessionKey, retrySession.ID)
 	if workspaceDir != "" {
@@ -1779,9 +1775,9 @@ func (e *Engine) maybeFailoverCronTurn(job *CronJob, effectivePlatform Platform,
 	e.cleanupInteractiveState(retryIKey)
 
 	if !job.Mute && retrySession.HistoryLen() < prevHistLen+2 {
-		return fmt.Errorf("cron job %q produced an empty response after provider failover to %q", job.ID, next)
+		return true, fmt.Errorf("cron job %q produced an empty response after provider failover to %q", job.ID, next)
 	}
-	return nil
+	return true, nil
 }
 
 // ExecuteTimerJob fires a one-shot timer job: resolves the platform, sends a
@@ -5952,6 +5948,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
 					return
 				}
+				sp.cleanupPreview()
 			}
 
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
@@ -6265,6 +6262,7 @@ channelClosed:
 					return
 				}
 			}
+			sp.cleanupPreview()
 		}
 	}
 }

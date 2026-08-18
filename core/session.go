@@ -239,6 +239,18 @@ func (s *Session) HistoryLen() int {
 	return len(s.History)
 }
 
+// GetLastAssistantContent returns the text content of the last "assistant" entry in history.
+func (s *Session) GetLastAssistantContent() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.History) - 1; i >= 0; i-- {
+		if s.History[i].Role == "assistant" {
+			return s.History[i].Content
+		}
+	}
+	return ""
+}
+
 // GetHistory returns the last n entries. If n <= 0, returns all.
 func (s *Session) GetHistory(n int) []HistoryEntry {
 	s.mu.Lock()

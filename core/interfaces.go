@@ -480,10 +480,10 @@ type ProviderSwitcher interface {
 // real reply. The engine consults it after a cron turn to decide whether a
 // provider failover retry is warranted.
 type SessionLimitDetector interface {
-	// IsSessionLimitEnding reports whether the given session's last assistant
-	// message is a session-quota wall termination. sessionID may be empty
-	// when the session produced no usable transcript.
-	IsSessionLimitEnding(ctx context.Context, sessionID string) (bool, error)
+	// IsSessionLimitEnding reports whether the turn termination represents a
+	// session/quota/rate-limit wall. sessionID is the agent session identifier,
+	// and content is the in-memory assistant response text (if available).
+	IsSessionLimitEnding(ctx context.Context, sessionID, content string) (bool, error)
 }
 
 // MemoryFileProvider is an optional interface for agents that support

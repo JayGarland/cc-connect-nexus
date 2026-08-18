@@ -812,3 +812,21 @@ func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 			DescZh: "跳过所有审批和沙箱（危险）"},
 	}
 }
+
+// IsSessionLimitEnding implements core.SessionLimitDetector for Codex.
+func (a *Agent) IsSessionLimitEnding(_ context.Context, _, content string) (bool, error) {
+	text := strings.TrimSpace(content)
+	if text == "" || len(text) > 300 || strings.Contains(text, "```") {
+		return false, nil
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "usage limit") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "quota exceeded") ||
+		strings.Contains(lower, "insufficient quota") ||
+		strings.Contains(lower, "credit limit") ||
+		strings.Contains(lower, "resets in") {
+		return true, nil
+	}
+	return false, nil
+}

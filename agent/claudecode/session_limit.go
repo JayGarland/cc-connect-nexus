@@ -6,29 +6,34 @@ import (
 	"strings"
 )
 
-// sessionLimitPatterns match the Claude Code session-quota wall. The
-// authoritative signal is the exact message Claude Code emits when the
-// subscription session budget is exhausted; the secondary patterns cover
-// localized/paraphrased variants without being so broad that a real reply
-// mentioning the phrase matches.
+// sessionLimitPatterns match the Claude Code session-quota and rate-limit walls.
 var sessionLimitPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)you'?ve hit your session limit`),
 	regexp.MustCompile(`(?i)you have hit your session limit`),
 	regexp.MustCompile(`(?i)session limit reached`),
+	regexp.MustCompile(`(?i)usage limit reached`),
+	regexp.MustCompile(`(?i)rate limit exceeded`),
+	regexp.MustCompile(`(?i)quota exhausted`),
+	regexp.MustCompile(`(?i)resets \d`),
+	regexp.MustCompile(`(?i)resets in \d`),
+	regexp.MustCompile(`(?i)resets at \d`),
 }
 
-// IsSessionLimitEnding reports whether the given session's last assistant
-// message is a session-quota wall termination rather than a real reply.
+// IsSessionLimitEnding reports whether the given session's response is a
+// session-quota wall termination rather than a real reply.
 //
-// Heuristics (deliberately conservative):
-//   - Only the last assistant entry is examined.
-//   - The content must match a session-limit pattern AND be short
-//     (< 200 chars). A real reply that merely quotes the phrase as part of
-//     a larger answer is long and structured, so it is not treated as a
-//     quota wall.
-//   - A missing/unreadable transcript returns (false, error) so callers
-//     can distinguish "not a limit ending" from "cannot tell".
-func (a *Agent) IsSessionLimitEnding(ctx context.Context, sessionID string) (bool, error) {
+// Heuristics:
+//   - Fast path: inspects the in-memory response text directly (0 disk I/O).
+//   - Fallback path: inspects the session transcript on disk if in-memory text is empty.
+//   - The content must match a quota/limit pattern AND be short (< 300 chars)
+//     without code fences (```).
+func (a *Agent) IsSessionLimitEnding(ctx context.Context, sessionID, content string) (bool, error) {
+	if text := strings.TrimSpace(content); text != "" {
+		if isQuotaWallText(text) {
+			return true, nil
+		}
+	}
+
 	if sessionID == "" {
 		return false, nil
 	}
@@ -36,25 +41,27 @@ func (a *Agent) IsSessionLimitEnding(ctx context.Context, sessionID string) (boo
 	if err != nil {
 		return false, err
 	}
-	// Scan backwards for the last assistant entry (limit=1 already returns
-	// the tail, but role-filter defensively).
 	for i := len(entries) - 1; i >= 0; i-- {
 		if entries[i].Role != "assistant" {
 			continue
 		}
-		content := strings.TrimSpace(entries[i].Content)
-		if content == "" {
-			continue
-		}
-		if len(content) > 200 {
-			return false, nil
-		}
-		for _, re := range sessionLimitPatterns {
-			if re.MatchString(content) {
-				return true, nil
-			}
+		if isQuotaWallText(entries[i].Content) {
+			return true, nil
 		}
 		return false, nil
 	}
 	return false, nil
+}
+
+func isQuotaWallText(content string) bool {
+	text := strings.TrimSpace(content)
+	if text == "" || len(text) > 300 || strings.Contains(text, "```") {
+		return false
+	}
+	for _, re := range sessionLimitPatterns {
+		if re.MatchString(text) {
+			return true
+		}
+	}
+	return false
 }

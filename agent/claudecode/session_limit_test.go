@@ -117,7 +117,7 @@ func TestIsSessionLimitEnding(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			sessionID := "test-session-" + sanitizeTestName(tc.name)
 			a := writeFakeTranscript(t, home, workDir, sessionID, tc.lines)
-			hit, err := a.IsSessionLimitEnding(ctx, sessionID)
+			hit, err := a.IsSessionLimitEnding(ctx, sessionID, "")
 			if tc.wantErr && err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -131,9 +131,37 @@ func TestIsSessionLimitEnding(t *testing.T) {
 	}
 }
 
+func TestIsSessionLimitEnding_InMemoryContent(t *testing.T) {
+	a := &Agent{}
+	ctx := context.Background()
+
+	// Direct in-memory matches (zero disk I/O)
+	hit, err := a.IsSessionLimitEnding(ctx, "", "You've hit your session limit · resets 10am")
+	if err != nil || !hit {
+		t.Fatalf("expected in-memory quota match, got hit=%v, err=%v", hit, err)
+	}
+
+	hit, err = a.IsSessionLimitEnding(ctx, "", "rate limit exceeded, please retry later")
+	if err != nil || !hit {
+		t.Fatalf("expected in-memory rate limit match, got hit=%v, err=%v", hit, err)
+	}
+
+	// Normal text should not match
+	hit, err = a.IsSessionLimitEnding(ctx, "", "Everything looks good and completed.")
+	if err != nil || hit {
+		t.Fatalf("expected normal text not to match, got hit=%v, err=%v", hit, err)
+	}
+
+	// Long text with code should not match
+	hit, err = a.IsSessionLimitEnding(ctx, "", "Here is code:\n```go\nfunc limit() {}\n```\nsession limit reached")
+	if err != nil || hit {
+		t.Fatalf("expected code block text not to match, got hit=%v, err=%v", hit, err)
+	}
+}
+
 func TestIsSessionLimitEnding_EmptySessionID(t *testing.T) {
 	a := &Agent{}
-	hit, err := a.IsSessionLimitEnding(context.Background(), "")
+	hit, err := a.IsSessionLimitEnding(context.Background(), "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

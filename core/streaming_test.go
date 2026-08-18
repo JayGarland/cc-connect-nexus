@@ -609,3 +609,107 @@ func TestStreamPreview_UnfreezeIdempotent(t *testing.T) {
 		t.Fatal("canPreview() = false after no-op unfreeze, want true")
 	}
 }
+
+type mockDeferredCleanerPlatform struct {
+	mockCleanerPlatform
+	deferCleanup bool
+}
+
+func (m *mockDeferredCleanerPlatform) DeferPreviewCleanup(handle any) bool {
+	return m.deferCleanup
+}
+
+func (m *mockDeferredCleanerPlatform) KeepPreviewForHandle(handle any) bool {
+	return false
+}
+
+func TestStreamPreview_DeferredPreviewCleanup(t *testing.T) {
+	mp := &mockDeferredCleanerPlatform{
+		deferCleanup: true,
+	}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    50,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Streaming draft content")
+	time.Sleep(100 * time.Millisecond)
+
+	// finish should return false (not kept in-place), but NOT delete immediately due to DeferPreviewCleanup
+	ok := sp.finish("Final response text", "")
+	if ok {
+		t.Fatal("finish should return false when KeepPreviewForHandle returns false")
+	}
+
+	mp.mu.Lock()
+	deletedCount := len(mp.deleted)
+	mp.mu.Unlock()
+
+	if deletedCount != 0 {
+		t.Fatalf("expected 0 delete calls during finish with deferred cleanup, got %d", deletedCount)
+	}
+
+	// Now explicitly call cleanupPreview() as the engine would do after successful send
+	sp.cleanupPreview()
+
+	mp.mu.Lock()
+	deletedCount = len(mp.deleted)
+	mp.mu.Unlock()
+
+	if deletedCount != 1 {
+		t.Fatalf("expected 1 delete call after sp.cleanupPreview(), got %d", deletedCount)
+	}
+}
+
+func TestStreamPreview_OrderingOnSendFailureAndSuccess(t *testing.T) {
+	mp := &mockDeferredCleanerPlatform{
+		deferCleanup: true,
+	}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    50,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Streaming draft content")
+	time.Sleep(100 * time.Millisecond)
+
+	// 1. finish() is called when turn completes with long text.
+	// Even if UpdateMessage fails or returns false, finish() must NOT delete the preview.
+	ok := sp.finish("Long response text exceeding limit", "")
+	if ok {
+		t.Fatal("finish() should return false when preview cannot be updated in-place")
+	}
+
+	mp.mu.Lock()
+	deletedCount := len(mp.deleted)
+	mp.mu.Unlock()
+
+	if deletedCount != 0 {
+		t.Fatalf("preview was prematurely deleted during finish() before final delivery confirmed, deleted count = %d", deletedCount)
+	}
+
+	// 2. Scenario A: If final delivery FAILS (engine does NOT call cleanupPreview):
+	// Preview remains active / not deleted.
+	mp.mu.Lock()
+	deletedCount = len(mp.deleted)
+	mp.mu.Unlock()
+	if deletedCount != 0 {
+		t.Fatalf("preview should remain when final send fails, got %d deletes", deletedCount)
+	}
+
+	// 3. Scenario B: When final delivery SUCCEEDS, engine calls sp.cleanupPreview():
+	sp.cleanupPreview()
+
+	mp.mu.Lock()
+	deletedCount = len(mp.deleted)
+	mp.mu.Unlock()
+	if deletedCount != 1 {
+		t.Fatalf("expected preview to be deleted once after final delivery success, got %d", deletedCount)
+	}
+}

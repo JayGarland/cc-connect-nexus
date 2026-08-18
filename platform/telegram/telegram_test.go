@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1066,4 +1067,204 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 		t.Fatalf("ProgressStyle() = %q, want compact", got)
 	}
 }
+
+func TestSendProactiveChunking(t *testing.T) {
+	var sendCalls int
+	p := newTelegramTestPlatform(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			sendCalls++
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":1}}`)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	// Message with 5000 chars of HTML
+	longContent := strings.Repeat("A", 5000)
+	if err := p.Send(context.Background(), replyContext{chatID: 123}, longContent); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+
+	if sendCalls < 2 {
+		t.Fatalf("sendCalls = %d, want >= 2 chunks", sendCalls)
+	}
+}
+
+func TestSendHTMLFailurePlaintextFallback(t *testing.T) {
+	var (
+		htmlAttempts      int
+		plaintextAttempts int
+	)
+	p := newTelegramTestPlatform(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), `name="parse_mode"`) {
+				htmlAttempts++
+				fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: custom entity bounds error"}`)
+				return
+			}
+			plaintextAttempts++
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":2}}`)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	if err := p.Send(context.Background(), replyContext{chatID: 123}, "Some text with *markdown*"); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+
+	if htmlAttempts != 1 {
+		t.Fatalf("htmlAttempts = %d, want 1", htmlAttempts)
+	}
+	if plaintextAttempts != 1 {
+		t.Fatalf("plaintextAttempts = %d, want 1", plaintextAttempts)
+	}
+}
+
+func TestSendChunkedHTMLFailurePlaintextFallback(t *testing.T) {
+	var (
+		htmlAttempts      int
+		plaintextAttempts int
+	)
+	p := newTelegramTestPlatform(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), `name="parse_mode"`) {
+				htmlAttempts++
+				fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: unclosed tag at chunk boundary"}`)
+				return
+			}
+			plaintextAttempts++
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":3}}`)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	bot, err := p.connectedBot("test")
+	if err != nil {
+		t.Fatalf("connectedBot: %v", err)
+	}
+
+	if err := p.sendChunked(context.Background(), bot, replyContext{chatID: 123}, "<b>chunk text</b>"); err != nil {
+		t.Fatalf("sendChunked returned error: %v", err)
+	}
+
+	if htmlAttempts != 1 {
+		t.Fatalf("htmlAttempts = %d, want 1", htmlAttempts)
+	}
+	if plaintextAttempts != 1 {
+		t.Fatalf("plaintextAttempts = %d, want 1", plaintextAttempts)
+	}
+}
+
+func TestIsEligibleRichMessage_LengthGuard(t *testing.T) {
+	shortTable := "| Header 1 | Header 2 |\n|---|---|\n| Cell 1 | Cell 2 |"
+	if !isEligibleRichMessage(shortTable) {
+		t.Fatalf("shortTable should be eligible for RichMessage")
+	}
+
+	// Long table exceeding 4096 runes
+	longRow := "| " + strings.Repeat("A", 100) + " | " + strings.Repeat("B", 100) + " |\n"
+	longTable := shortTable + "\n" + strings.Repeat(longRow, 30)
+	if utf8.RuneCountInString(longTable) <= telegramMaxMessageLen {
+		t.Fatalf("longTable length should exceed telegramMaxMessageLen")
+	}
+	if isEligibleRichMessage(longTable) {
+		t.Fatalf("longTable exceeding max length should NOT be eligible for direct RichMessage")
+	}
+}
+
+func TestDeferPreviewCleanup(t *testing.T) {
+	p := &Platform{}
+	draftHandle := &telegramPreviewHandle{chatID: 123, draftID: 456, isDraft: true}
+	msgHandle := &telegramPreviewHandle{chatID: 123, messageID: 789, isDraft: false}
+
+	if !p.DeferPreviewCleanup(draftHandle) {
+		t.Fatalf("DeferPreviewCleanup should return true for draftHandle")
+	}
+	if p.DeferPreviewCleanup(msgHandle) {
+		t.Fatalf("DeferPreviewCleanup should return false for msgHandle")
+	}
+	if p.KeepPreviewForHandle(draftHandle) {
+		t.Fatalf("KeepPreviewForHandle should return false for draftHandle")
+	}
+	if !p.KeepPreviewForHandle(msgHandle) {
+		t.Fatalf("KeepPreviewForHandle should return true for msgHandle")
+	}
+}
+
+func TestSendWithButtons_LongMessageChunked(t *testing.T) {
+	var sendCalls int
+	p := newTelegramTestPlatform(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			sendCalls++
+			fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d}}`, sendCalls)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	longContent := strings.Repeat("This is a long test paragraph. ", 200)
+	buttons := [][]core.ButtonOption{{{Text: "Copy SHA", Data: "copy:abc1234"}}}
+
+	if err := p.SendWithButtons(context.Background(), replyContext{chatID: 123}, longContent, buttons); err != nil {
+		t.Fatalf("SendWithButtons returned error: %v", err)
+	}
+
+	if sendCalls < 2 {
+		t.Fatalf("expected at least 2 chunks sent for long message with buttons, got %d", sendCalls)
+	}
+}
+
+func TestSend_ReplyMarkupOmittedWhenNoButtons(t *testing.T) {
+	var interceptedRequests []string
+	p := newTelegramTestPlatform(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		interceptedRequests = append(interceptedRequests, string(body))
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":100}}`)
+	})
+
+	ctx := context.Background()
+	rc := replyContext{chatID: 123, messageID: 456}
+
+	// 1. Plain Send
+	if err := p.Send(ctx, rc, "Hello without buttons"); err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+
+	// 2. Reply
+	if err := p.Reply(ctx, rc, "Reply without buttons"); err != nil {
+		t.Fatalf("Reply failed: %v", err)
+	}
+
+	// 3. Long Send (>4096)
+	longText := strings.Repeat("Long text chunk without buttons. ", 200)
+	if err := p.Send(ctx, rc, longText); err != nil {
+		t.Fatalf("Send long text failed: %v", err)
+	}
+
+	// Verify all requests without buttons have NO reply_markup field
+	for i, req := range interceptedRequests {
+		if strings.Contains(req, "reply_markup") {
+			t.Fatalf("request %d contained reply_markup in payload: %s", i, req)
+		}
+	}
+
+	// 4. Now test SendWithButtons -> MUST contain reply_markup
+	interceptedRequests = nil
+	buttons := [][]core.ButtonOption{{{Text: "Click", Data: "test"}}}
+	if err := p.SendWithButtons(ctx, rc, "Message with buttons", buttons); err != nil {
+		t.Fatalf("SendWithButtons failed: %v", err)
+	}
+
+	if len(interceptedRequests) == 0 {
+		t.Fatalf("expected at least 1 request for SendWithButtons")
+	}
+	if !strings.Contains(interceptedRequests[0], "reply_markup") {
+		t.Fatalf("expected request to contain reply_markup for SendWithButtons, got: %s", interceptedRequests[0])
+	}
+}
+
 

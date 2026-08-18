@@ -15994,3 +15994,29 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
 	}
 }
+
+type mockQuietPlatform struct {
+	stubPlatformEngine
+	sep string
+}
+
+func (m *mockQuietPlatform) QuietSeparator() string {
+	return m.sep
+}
+
+func TestQuietSeparator(t *testing.T) {
+	defaultPlat := &stubPlatformEngine{n: "slack"}
+	if got := quietSeparator(defaultPlat); got != "\n\n" {
+		t.Fatalf("expected default separator %q, got %q", "\n\n", got)
+	}
+
+	customPlat := &mockQuietPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}, sep: "\n"}
+	if got := quietSeparator(customPlat); got != "\n" {
+		t.Fatalf("expected custom separator %q, got %q", "\n", got)
+	}
+
+	emptyPlat := &mockQuietPlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}, sep: ""}
+	if got := quietSeparator(emptyPlat); got != "\n\n" {
+		t.Fatalf("expected fallback separator %q, got %q", "\n\n", got)
+	}
+}
