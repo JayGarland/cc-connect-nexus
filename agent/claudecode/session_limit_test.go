@@ -99,7 +99,15 @@ func TestIsSessionLimitEnding(t *testing.T) {
 			wantHit: false,
 		},
 		{
-			name:    "empty transcript",
+			name: "single-object content block (real claude shape)",
+			lines: []string{
+				transcriptLine("user", "user", `"Standing Participation v1 scheduled check."`),
+				`{"type":"assistant","timestamp":"2026-08-18T09:52:12+02:00","message":{"role":"assistant","content":{"type":"text","text":"You've hit your session limit · resets 10am (Europe/Paris)"}}}`,
+			},
+			wantHit: true,
+		},
+		{
+			name: "empty transcript",
 			lines:   []string{},
 			wantHit: false,
 		},
