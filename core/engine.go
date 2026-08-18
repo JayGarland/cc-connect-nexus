@@ -1652,20 +1652,26 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		// (prevHistLen+2). This approach correctly detects empty responses across all
 		// delivery modes (plain text, cards, rich cards, DingTalk AI streaming) because
 		// AddHistory("assistant",...) is called before any platform-specific rendering path.
-		if !job.Mute && session.HistoryLen() < prevHistLen+2 {
-			// A session-quota wall termination (e.g. Claude Code's
-			// "You've hit your session limit") produces exactly this empty
-			// assistant slot while doing no real work. When the agent can
-			// recognize it and a fallback provider is configured, fail over
-			// once: switch provider, run the same job in a fresh side
-			// session, and report the retry's outcome. cleanupInteractiveState
-			// runs after the failover attempt.
+		//
+		// A session-quota wall (e.g. Claude Code's "You've hit your session
+		// limit") is NOT an empty response — the agent emits the wall text as
+		// a regular assistant reply — so the limit check runs after every
+		// turn, not only in the empty branch. When the agent recognizes the
+		// termination as a quota wall and a fallback provider is configured,
+		// fail over once: switch provider, run the same job in a fresh side
+		// session, and report the retry's outcome. cleanupInteractiveState
+		// runs after the failover attempt.
+		if !job.Mute {
+			empty := session.HistoryLen() < prevHistLen+2
 			err := e.maybeFailoverCronTurn(job, effectivePlatform, msg, agent, sessions, runSessionKey, workspaceDir, session)
 			e.cleanupInteractiveState(iKey)
 			if err != nil {
 				return err
 			}
-			return fmt.Errorf("cron job %q produced an empty response", job.ID)
+			if empty {
+				return fmt.Errorf("cron job %q produced an empty response", job.ID)
+			}
+			return nil
 		}
 		e.cleanupInteractiveState(iKey)
 		return nil
