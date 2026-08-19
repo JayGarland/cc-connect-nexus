@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -575,9 +574,14 @@ func readConversationRecord(path, filenameID string) (conversationRecord, bool) 
 		}
 		return conversationRecord{ID: id, Workspaces: normalizeWorkspaceURIs(meta.WorkspaceURIs)}, true
 	}
-	workspaces := extractWorkspaceURIs(blob)
-	if len(workspaces) == 0 {
+	storedIDs, workspaces, ok := parseTrajectoryMetadataBlob(blob)
+	if !ok || len(storedIDs) == 0 || len(workspaces) == 0 {
 		return conversationRecord{}, false
+	}
+	for _, id := range storedIDs {
+		if id != filenameID {
+			return conversationRecord{}, false
+		}
 	}
 	return conversationRecord{ID: filenameID, Workspaces: workspaces}, true
 }
@@ -636,12 +640,97 @@ func canonicalWorkspacePath(value string) string {
 }
 
 func parseTime(value string) time.Time { t, _ := time.Parse(time.RFC3339Nano, value); return t }
-func extractWorkspaceURIs(blob []byte) []string {
-	var found []string
-	for _, match := range regexp.MustCompile(`(?i)file:///[^\x00-\x1f"']+`).FindAllString(string(blob), -1) {
-		found = append(found, match)
+
+// parseTrajectoryMetadataBlob reads only the proven top-level protobuf fields:
+// fields 3/4 carry the conversation identity and field 7 carries workspace URIs.
+func parseTrajectoryMetadataBlob(blob []byte) (ids, workspaces []string, ok bool) {
+	for len(blob) > 0 {
+		key, n := readProtoVarint(blob)
+		if n == 0 {
+			return nil, nil, false
+		}
+		blob = blob[n:]
+		field, wireType := int(key>>3), key&7
+		if field == 0 {
+			return nil, nil, false
+		}
+		if wireType == 2 {
+			length, n := readProtoVarint(blob)
+			if n == 0 || length > uint64(len(blob)-n) {
+				return nil, nil, false
+			}
+			value := string(blob[n : n+int(length)])
+			blob = blob[n+int(length):]
+			switch field {
+			case 3, 4:
+				if isConversationID(value) {
+					ids = append(ids, value)
+				}
+			case 7:
+				workspaces = append(workspaces, value)
+			}
+			continue
+		}
+		n = skipProtoValue(blob, wireType)
+		if n == 0 {
+			return nil, nil, false
+		}
+		blob = blob[n:]
 	}
-	return normalizeWorkspaceURIs(found)
+	workspaces = normalizeWorkspaceURIs(workspaces)
+	return ids, workspaces, len(ids) > 0 && len(workspaces) > 0
+}
+
+func readProtoVarint(data []byte) (uint64, int) {
+	var value uint64
+	for i, b := range data {
+		if i == 10 || (i == 9 && b > 1) {
+			return 0, 0
+		}
+		value |= uint64(b&0x7f) << (7 * i)
+		if b < 0x80 {
+			return value, i + 1
+		}
+	}
+	return 0, 0
+}
+
+func isConversationID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, r := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if r != '-' {
+				return false
+			}
+			continue
+		}
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func skipProtoValue(data []byte, wireType uint64) int {
+	switch wireType {
+	case 0:
+		_, n := readProtoVarint(data)
+		return n
+	case 1:
+		if len(data) < 8 {
+			return 0
+		}
+		return 8
+	case 5:
+		if len(data) < 4 {
+			return 0
+		}
+		return 4
+	default:
+		return 0
+	}
 }
 
 func extractTranscriptInfo(transcriptPath string) (summary string, msgCount int) {

@@ -56,16 +56,64 @@ func TestListAntigravitySessions_FallbackAndMalformed(t *testing.T) {
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	db := summariesDB(t, filepath.Join(base, "conversation_summaries.db"))
 	defer db.Close()
-	summary(t, db, "fallback", nil)
-	fallbackConversationDB(t, base, "fallback", "file:///F:/worlds/world-nexus")
+	fallbackID := "11111111-1111-4111-8111-111111111111"
+	summary(t, db, fallbackID, nil)
+	protobufConversationDB(t, base, fallbackID, fallbackID, []string{"file:///F:/worlds/world-nexus"})
 	conversationDB(t, base, "broken", nil)
 	db.Close()
 	got, err := listAntigravitySessions("F:\\worlds\\world-nexus")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].ID != "fallback" {
+	if len(got) != 1 || got[0].ID != fallbackID {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestDeleteSession_RejectsProtobufIdentityMismatch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	requested := "11111111-1111-4111-8111-111111111111"
+	protobufConversationDB(t, base, requested, "22222222-2222-4222-8222-222222222222", []string{"file:///F:/worlds/world-nexus"})
+	transcript(t, base, requested)
+	a := &Agent{workDir: "F:\\worlds\\world-nexus"}
+	if err := a.DeleteSession(context.Background(), requested); err == nil {
+		t.Fatal("protobuf identity mismatch unexpectedly deleted")
+	}
+	if _, err := os.Stat(filepath.Join(base, "conversations", requested+".db")); err != nil {
+		t.Fatalf("mismatched conversation was deleted: %v", err)
+	}
+}
+
+func TestDeleteSession_AcceptsStructuredProtobufRecord(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	owned := "11111111-1111-4111-8111-111111111111"
+	protobufConversationDB(t, base, owned, owned, []string{"file:///F:/worlds/world-nexus"})
+	transcript(t, base, owned)
+	a := &Agent{workDir: "F:\\worlds\\world-nexus"}
+	if err := a.DeleteSession(context.Background(), owned); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+}
+
+func TestParseTrajectoryMetadataBlob_ExtractsOnlyStructuredFields(t *testing.T) {
+	id := "11111111-1111-4111-8111-111111111111"
+	blob := append(protobufString(3, id), protobufString(4, id)...)
+	blob = append(blob, protobufString(7, "file:///F:/worlds/world-nexus")...)
+	ids, workspaces, ok := parseTrajectoryMetadataBlob(blob)
+	if !ok || len(ids) != 2 || ids[0] != id || ids[1] != id || len(workspaces) != 1 {
+		t.Fatalf("parseTrajectoryMetadataBlob = (%q, %q, %v)", ids, workspaces, ok)
+	}
+}
+
+func TestParseTrajectoryMetadataBlob_RejectsMalformedData(t *testing.T) {
+	if _, _, ok := parseTrajectoryMetadataBlob([]byte{0x1a, 0x80}); ok {
+		t.Fatal("malformed protobuf was accepted")
 	}
 }
 
@@ -154,9 +202,9 @@ func conversationDBWithIdentity(t *testing.T, base, filenameID, storedID string,
 	}
 }
 
-func fallbackConversationDB(t *testing.T, base, id, workspaceURI string) {
+func protobufConversationDB(t *testing.T, base, filenameID, storedID string, workspaces []string) {
 	t.Helper()
-	path := filepath.Join(base, "conversations", id+".db")
+	path := filepath.Join(base, "conversations", filenameID+".db")
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -166,9 +214,27 @@ func fallbackConversationDB(t *testing.T, base, id, workspaceURI string) {
 	if _, err = db.Exec("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec("INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?)", []byte("\x0a"+workspaceURI+"\x12ignored")); err != nil {
+	blob := append(protobufString(3, storedID), protobufString(4, storedID)...)
+	for _, workspace := range workspaces {
+		blob = append(blob, protobufString(7, workspace)...)
+	}
+	if _, err = db.Exec("INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?)", blob); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func protobufString(field int, value string) []byte {
+	result := appendProtoVarint(nil, uint64(field<<3|2))
+	result = appendProtoVarint(result, uint64(len(value)))
+	return append(result, value...)
+}
+
+func appendProtoVarint(dst []byte, value uint64) []byte {
+	for value >= 0x80 {
+		dst = append(dst, byte(value)|0x80)
+		value >>= 7
+	}
+	return append(dst, byte(value))
 }
 
 func transcript(t *testing.T, base, id string) {
