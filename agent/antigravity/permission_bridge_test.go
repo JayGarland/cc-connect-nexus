@@ -17,6 +17,7 @@ import (
 func TestAgyPermissionBridgePreservesHooksAndRelaysDecisions(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
 
 	realConfigDir := filepath.Join(homeDir, ".gemini", "config")
 	if err := os.MkdirAll(realConfigDir, 0o700); err != nil {

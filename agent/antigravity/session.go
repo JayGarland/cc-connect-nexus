@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,21 +74,6 @@ func newAntigravitySession(ctx context.Context, cmd string, extraArgs []string, 
 func (as *antigravitySession) Send(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	if !as.alive.Load() {
 		return fmt.Errorf("session is closed")
-	}
-
-	// Capture existing chat logs so we can identify a new session on first turn
-	preEntries := make(map[string]bool)
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		slug := antigravityProjectSlug(as.workDir)
-		chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
-		if entries, err := os.ReadDir(chatsDir); err == nil {
-			for _, entry := range entries {
-				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
-					preEntries[entry.Name()] = true
-				}
-			}
-		}
 	}
 
 	// Save images and files into the workspace
@@ -200,7 +184,7 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	as.wg.Add(1)
 	go func() {
 		defer cancel()
-		as.readLoop(ctx, cmd, stdout, &stderrBuf, append(imageRefs, fileRefs...), preEntries, time.Now())
+		as.readLoop(ctx, cmd, stdout, &stderrBuf, append(imageRefs, fileRefs...))
 	}()
 
 	return nil
@@ -223,11 +207,117 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	case "plan":
 		args = append(args, "--sandbox")
 	}
-	args = append(args, "-p", fullPrompt)
+	args = append(args, "--output-format", "stream-json", "-p", fullPrompt)
 	return args
 }
 
-func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempFiles []string, preEntries map[string]bool, sendStartedAt time.Time) {
+type agyStreamLine struct {
+	Event          string          `json:"event"`
+	ConversationID string          `json:"conversation_id"`
+	Init           *agyInitEvent   `json:"init,omitempty"`
+	StepUpdate     *agyStepUpdate  `json:"step_update,omitempty"`
+	Result         *agyResultEvent `json:"result,omitempty"`
+}
+
+type agyInitEvent struct {
+	Cwd            string   `json:"cwd"`
+	Tools          []string `json:"tools"`
+	PermissionMode string   `json:"permission_mode"`
+}
+
+type agyStepUpdate struct {
+	ConversationID string  `json:"conversation_id"`
+	StepIndex      int     `json:"step_index"`
+	State          string  `json:"state"`
+	StepType       string  `json:"step_type"`
+	TextDelta      string  `json:"text_delta"`
+	DurationSeconds float64 `json:"duration_seconds"`
+}
+
+type agyResultEvent struct {
+	ConversationID string  `json:"conversation_id"`
+	Status         string  `json:"status"`
+	Response       string  `json:"response"`
+	DurationSeconds float64 `json:"duration_seconds"`
+	NumTurns       int     `json:"num_turns"`
+}
+
+func parseAgyStreamLine(line []byte) (*agyStreamLine, string, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return nil, "", false
+	}
+	if trimmed[0] != '{' {
+		return nil, string(line), false
+	}
+	var ev agyStreamLine
+	if err := json.Unmarshal(trimmed, &ev); err != nil || ev.Event == "" {
+		return nil, string(line), false
+	}
+	return &ev, "", true
+}
+
+func (as *antigravitySession) handleStreamEvent(ev *agyStreamLine, hasEmittedText *bool) {
+	// 1. Capture conversation ID as early as possible.
+	cid := ev.ConversationID
+	if cid == "" && ev.StepUpdate != nil {
+		cid = ev.StepUpdate.ConversationID
+	}
+	if cid == "" && ev.Result != nil {
+		cid = ev.Result.ConversationID
+	}
+	if cid != "" && as.CurrentSessionID() == "" {
+		as.chatID.Store(cid)
+		slog.Debug("antigravitySession: detected session ID from stream event", "event", ev.Event, "session_id", cid)
+		select {
+		case as.events <- core.Event{Type: core.EventText, SessionID: cid}:
+		case <-as.ctx.Done():
+			return
+		}
+	}
+
+	// 2. Process event content
+	switch ev.Event {
+	case "init":
+		// Already captured conversation_id above.
+
+	case "step_update":
+		if ev.StepUpdate == nil {
+			return
+		}
+		switch ev.StepUpdate.StepType {
+		case "agent_response":
+			if ev.StepUpdate.TextDelta != "" {
+				*hasEmittedText = true
+				select {
+				case as.events <- core.Event{Type: core.EventText, Content: ev.StepUpdate.TextDelta}:
+				case <-as.ctx.Done():
+					return
+				}
+			}
+		case "thinking":
+			if ev.StepUpdate.TextDelta != "" {
+				select {
+				case as.events <- core.Event{Type: core.EventThinking, Content: ev.StepUpdate.TextDelta}:
+				case <-as.ctx.Done():
+					return
+				}
+			}
+		}
+
+	case "result":
+		if ev.Result != nil && !*hasEmittedText && ev.Result.Response != "" {
+			*hasEmittedText = true
+			select {
+			case as.events <- core.Event{Type: core.EventText, Content: ev.Result.Response}:
+			case <-as.ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempFiles []string) {
 	defer as.wg.Done()
 	defer func() {
 		for _, f := range tempFiles {
@@ -235,30 +325,6 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		}
 
 		err := cmd.Wait()
-
-		// Detect conversation ID if this was the first turn of a fresh session.
-		// agy may flush the chat file only while the process is exiting, so wait
-		// for process reaping before scanning the chat directory.
-		if as.CurrentSessionID() == "" {
-			var sid string
-			for attempt := 0; attempt < 15; attempt++ {
-				sid = as.detectNewSessionID(preEntries, sendStartedAt)
-				if sid != "" {
-					break
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
-			if sid != "" {
-				as.chatID.Store(sid)
-				slog.Debug("antigravitySession: detected session ID", "session_id", sid)
-				// Emit an EventText carrying the session ID back to core.
-				select {
-				case as.events <- core.Event{Type: core.EventText, SessionID: sid}:
-				case <-as.ctx.Done():
-				}
-			}
-		}
-
 		sid := as.CurrentSessionID()
 		if err != nil {
 			stderrMsg := strings.TrimSpace(stderrBuf.String())
@@ -284,16 +350,21 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 	}()
 
 	reader := bufio.NewReader(stdout)
-	buf := make([]byte, 1024)
+	var hasEmittedText bool
 
 	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			text := string(buf[:n])
-			select {
-			case as.events <- core.Event{Type: core.EventText, Content: text}:
-			case <-as.ctx.Done():
-				return
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			ev, rawText, isJSON := parseAgyStreamLine(line)
+			if isJSON && ev != nil {
+				as.handleStreamEvent(ev, &hasEmittedText)
+			} else if rawText != "" {
+				hasEmittedText = true
+				select {
+				case as.events <- core.Event{Type: core.EventText, Content: rawText}:
+				case <-as.ctx.Done():
+					return
+				}
 			}
 		}
 		if err != nil {
@@ -307,82 +378,6 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 			return
 		}
 	}
-}
-
-func (as *antigravitySession) detectNewSessionID(preEntries map[string]bool, sendStartedAt time.Time) string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	slug := antigravityProjectSlug(as.workDir)
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
-
-	entries, err := os.ReadDir(chatsDir)
-	if err != nil {
-		return ""
-	}
-
-	type candidate struct {
-		sessionID string
-		modTime   time.Time
-		diff      time.Duration
-	}
-	var candidates []candidate
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
-		}
-		if preEntries[entry.Name()] {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		mod := info.ModTime()
-		if !sendStartedAt.IsZero() && mod.Before(sendStartedAt.Add(-2*time.Second)) {
-			continue
-		}
-
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		if scanner.Scan() {
-			var sf struct {
-				SessionID string `json:"sessionId"`
-			}
-			if json.Unmarshal([]byte(scanner.Text()), &sf) == nil && sf.SessionID != "" {
-				diff := time.Duration(0)
-				if !sendStartedAt.IsZero() {
-					if mod.After(sendStartedAt) {
-						diff = mod.Sub(sendStartedAt)
-					} else {
-						diff = sendStartedAt.Sub(mod)
-					}
-				}
-				candidates = append(candidates, candidate{
-					sessionID: sf.SessionID,
-					modTime:   mod,
-					diff:      diff,
-				})
-			}
-		}
-		_ = file.Close()
-	}
-	if len(candidates) == 0 {
-		return ""
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].diff == candidates[j].diff {
-			return candidates[i].modTime.After(candidates[j].modTime)
-		}
-		return candidates[i].diff < candidates[j].diff
-	})
-	return candidates[0].sessionID
 }
 
 func (as *antigravitySession) RespondPermission(requestID string, result core.PermissionResult) error {
