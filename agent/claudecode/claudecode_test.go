@@ -931,3 +931,52 @@ func TestNew_WorkDirDoesNotExist(t *testing.T) {
 		t.Fatalf("expected 'does not exist' in error, got: %v", err)
 	}
 }
+
+func TestExtractTextContent_Shapes(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "plain string",
+			raw:  `"Hello, this is a plain text message."`,
+			want: "Hello, this is a plain text message.",
+		},
+		{
+			name: "single content block object text",
+			raw:  `{"type":"text","text":"You've hit your session limit · resets 10am (Europe/Paris)"}`,
+			want: "You've hit your session limit · resets 10am (Europe/Paris)",
+		},
+		{
+			name: "single content block object thinking",
+			raw:  `{"type":"thinking","thinking":"I should check the files first."}`,
+			want: "I should check the files first.",
+		},
+		{
+			name: "array of content blocks",
+			raw:  `[{"type":"thinking","thinking":"Thinking..."},{"type":"text","text":"Final answer"}]`,
+			want: "Final answer",
+		},
+		{
+			name: "empty raw message",
+			raw:  ``,
+			want: "",
+		},
+		{
+			name: "non-text object",
+			raw:  `{"type":"tool_use","name":"Bash"}`,
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractTextContent([]byte(tt.raw))
+			if got != tt.want {
+				t.Errorf("extractTextContent(%s) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+

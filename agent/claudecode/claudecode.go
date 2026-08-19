@@ -767,6 +767,23 @@ func extractTextContent(raw json.RawMessage) string {
 		return s
 	}
 
+	// Try single content block object (Claude Code emits a lone object
+	// rather than an array for one-block assistant messages).
+	var single struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"`
+	}
+	if json.Unmarshal(raw, &single) == nil {
+		if single.Type == "text" && single.Text != "" {
+			return single.Text
+		}
+		if single.Type == "thinking" && single.Thinking != "" {
+			return single.Thinking
+		}
+		return ""
+	}
+
 	// Try array of content blocks
 	var blocks []struct {
 		Type     string `json:"type"`

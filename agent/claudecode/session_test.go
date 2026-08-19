@@ -775,3 +775,94 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 }
+
+func TestHandleAssistant_SingleObjectContent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{
+		events: make(chan core.Event, 8),
+		ctx:    ctx,
+	}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+
+	// Test 1: single text object in msg["content"]
+	rawText := map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role": "assistant",
+			"content": map[string]any{
+				"type": "text",
+				"text": "Hello from single-object content block",
+			},
+		},
+	}
+	cs.handleAssistant(rawText)
+
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventText {
+			t.Fatalf("evt.Type = %v, want EventText", evt.Type)
+		}
+		if evt.Content != "Hello from single-object content block" {
+			t.Fatalf("evt.Content = %q, want 'Hello from single-object content block'", evt.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for EventText from single-object content block")
+	}
+
+	// Test 2: single tool_use object in msg["content"]
+	rawTool := map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role": "assistant",
+			"content": map[string]any{
+				"type":  "tool_use",
+				"name":  "Bash",
+				"input": map[string]any{"command": "echo test"},
+			},
+		},
+	}
+	cs.handleAssistant(rawTool)
+
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventToolUse {
+			t.Fatalf("evt.Type = %v, want EventToolUse", evt.Type)
+		}
+		if evt.ToolName != "Bash" {
+			t.Fatalf("evt.ToolName = %q, want Bash", evt.ToolName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for EventToolUse from single-object content block")
+	}
+
+	// Test 3: standard array of objects in msg["content"] (regression)
+	rawArray := map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type": "text",
+					"text": "Hello from array content block",
+				},
+			},
+		},
+	}
+	cs.handleAssistant(rawArray)
+
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventText {
+			t.Fatalf("evt.Type = %v, want EventText", evt.Type)
+		}
+		if evt.Content != "Hello from array content block" {
+			t.Fatalf("evt.Content = %q, want 'Hello from array content block'", evt.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for EventText from array content block")
+	}
+}
+
