@@ -434,6 +434,8 @@ func main() {
 		engine.SetBaseWorkDir(workDir)
 		engine.SetProjectStateStore(projectState)
 		engine.SetDataDir(cfg.DataDir)
+		primary, fallback := core.ParseProviderFailoverOptions(proj.Agent.Options)
+		engine.SetProviderFailover(primary, fallback)
 
 		// Wire multi-workspace mode
 		if proj.Mode == "multi-workspace" {
@@ -1837,6 +1839,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 			ps.SetActiveProvider(active)
 		}
 	}
+	primary, fallback := core.ParseProviderFailoverOptions(proj.Agent.Options)
+	engine.SetProviderFailover(primary, fallback)
 
 	// Reload custom commands
 	engine.ClearCommands("config")

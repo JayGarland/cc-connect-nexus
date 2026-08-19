@@ -429,6 +429,11 @@ type Engine struct {
 	showWorkdirIndicator bool
 	replyFooterEnabled   bool
 
+	// Provider failover & cron recovery
+	primaryProvider     string
+	fallbackProviders   []string
+	cronRecoveryDecider CronRecoveryDecider
+
 	// When true, /list etc. only show sessions tracked by cc-connect,
 	// hiding sessions created by direct CLI usage in the same work_dir.
 	// Default false = show all sessions.
@@ -892,6 +897,32 @@ func (e *Engine) SetInstantReply(cfg InstantReplyCfg) {
 func (e *Engine) SetReferenceConfig(cfg ReferenceRenderCfg) {
 	e.references = normalizeReferenceRenderCfg(cfg)
 }
+
+// SetProviderFailover configures the primary and fallback provider chain used
+// by new_per_run cron recovery.
+func (e *Engine) SetProviderFailover(primary string, fallback []string) {
+	e.primaryProvider = primary
+	e.fallbackProviders = fallback
+	if e.cronRecoveryDecider == nil && defaultCronRecoveryDeciderFactory != nil {
+		e.cronRecoveryDecider = defaultCronRecoveryDeciderFactory(primary, fallback)
+	}
+}
+
+// SetCronRecoveryDecider sets a custom CronRecoveryDecider on the engine.
+func (e *Engine) SetCronRecoveryDecider(decider CronRecoveryDecider) {
+	e.cronRecoveryDecider = decider
+}
+
+// PrimaryProvider returns the configured primary provider.
+func (e *Engine) PrimaryProvider() string {
+	return e.primaryProvider
+}
+
+// FallbackProviders returns the configured fallback providers.
+func (e *Engine) FallbackProviders() []string {
+	return e.fallbackProviders
+}
+
 
 // estimateTokens provides a rough token estimate for a set of history entries.
 func estimateTokens(entries []HistoryEntry) int {
@@ -1603,6 +1634,13 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 
 	if useNewSession {
 		msg.SessionKey = runSessionKey
+		// Reset to configured primary provider before each new_per_run cron run
+		// so a previous failover does not leak into this run.
+		if e.primaryProvider != "" {
+			if ps, ok := agent.(ProviderSwitcher); ok {
+				ps.SetActiveProvider(e.primaryProvider)
+			}
+		}
 		session := sessions.NewSideSession(runSessionKey, "cron-"+job.ID)
 		if !session.TryLock() {
 			return fmt.Errorf("session %q is busy", runSessionKey)
@@ -1613,15 +1651,77 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		}
 		prevHistLen := session.HistoryLen()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
-		e.cleanupInteractiveState(iKey)
+
 		// Empty-response detection via session history delta: processInteractiveMessageWith
 		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
 		// (prevHistLen+2). This approach correctly detects empty responses across all
 		// delivery modes (plain text, cards, rich cards, DingTalk AI streaming) because
 		// AddHistory("assistant",...) is called before any platform-specific rendering path.
-		if !job.Mute && session.HistoryLen() < prevHistLen+2 {
-			return fmt.Errorf("cron job %q produced an empty response", job.ID)
+		if !job.Mute {
+			empty := session.HistoryLen() < prevHistLen+2
+			if e.cronRecoveryDecider != nil {
+				outcome := CronTurnOutcome{
+					Job:            job,
+					Session:        session,
+					Agent:          agent,
+					AgentSessionID: session.GetAgentSessionID(),
+					EmptyResponse:  empty,
+				}
+				decision, recErr := e.cronRecoveryDecider.DecideCronRecovery(context.Background(), outcome)
+				if recErr != nil {
+					slog.Warn("cron: recovery decision error", "job", job.ID, "error", recErr)
+				} else if decision.ShouldRetry && decision.NextProvider != "" {
+					if ps, ok := agent.(ProviderSwitcher); ok {
+						if ps.SetActiveProvider(decision.NextProvider) {
+							slog.Warn("cron: provider failover after quota wall",
+								"job", job.ID, "to", decision.NextProvider, "session", runSessionKey)
+							// Retry once in a fresh side session
+							retrySession := sessions.NewSideSession(runSessionKey, "cron-"+job.ID+"-failover")
+							if !retrySession.TryLock() {
+								e.cleanupInteractiveState(iKey)
+								return fmt.Errorf("cron job %q: failover retry session busy", job.ID)
+							}
+							retryIKey := fmt.Sprintf("%s#cron:%s", runSessionKey, retrySession.ID)
+							if workspaceDir != "" {
+								retryIKey = workspaceDir + ":" + retryIKey
+							}
+							prevRetryLen := retrySession.HistoryLen()
+							e.processInteractiveMessageWith(effectivePlatform, msg, retrySession, agent, sessions, retryIKey, workspaceDir, runSessionKey)
+							e.cleanupInteractiveState(retryIKey)
+
+							retryEmpty := retrySession.HistoryLen() < prevRetryLen+2
+							if retryEmpty {
+								e.cleanupInteractiveState(iKey)
+								return fmt.Errorf("cron job %q produced an empty response after provider failover to %q", job.ID, decision.NextProvider)
+							}
+							retryOutcome := CronTurnOutcome{
+								Job:            job,
+								Session:        retrySession,
+								Agent:          agent,
+								AgentSessionID: retrySession.GetAgentSessionID(),
+								EmptyResponse:  retryEmpty,
+							}
+							retryDecision, _ := e.cronRecoveryDecider.DecideCronRecovery(context.Background(), retryOutcome)
+							if retryDecision.IsFailure {
+								e.cleanupInteractiveState(iKey)
+								return fmt.Errorf("cron job %q failed after provider failover: %s", job.ID, retryDecision.FailureReason)
+							}
+							e.cleanupInteractiveState(iKey)
+							return nil
+						}
+					}
+				} else if decision.IsFailure {
+					e.cleanupInteractiveState(iKey)
+					return fmt.Errorf("cron job %q failed: %s", job.ID, decision.FailureReason)
+				}
+			}
+
+			if empty {
+				e.cleanupInteractiveState(iKey)
+				return fmt.Errorf("cron job %q produced an empty response", job.ID)
+			}
 		}
+		e.cleanupInteractiveState(iKey)
 		return nil
 	}
 
