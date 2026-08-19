@@ -298,26 +298,11 @@ func codexImageExt(mime string) string {
 
 func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	defer cs.wg.Done()
-	defer func() {
-		defer cs.removeCmd(cmd)
-		if err := cmd.Wait(); err != nil {
-			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
-				slog.Error("codexSession: process failed", "error", err, "stderr", stderrMsg)
-				evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-				select {
-				case cs.events <- evt:
-				case <-cs.ctx.Done():
-					return
-				}
-			}
-		}
-		if tid := cs.CurrentSessionID(); tid != "" {
-			patchSessionSource(tid, getenvFromList(cs.extraEnv, "CODEX_HOME"))
-		}
-	}()
 
-	if err := readJSONLines(stdout, func(line []byte) error {
+	var turnCompleted bool
+	var turnFailedErr string
+
+	scanErr := readJSONLines(stdout, func(line []byte) error {
 		lineText := string(line)
 		if lineText == "" {
 			return nil
@@ -331,16 +316,73 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 			return nil
 		}
 
-		cs.handleEvent(raw)
-		return nil
-	}); err != nil {
-		slog.Error("codexSession: read stdout error", "error", err)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
-		select {
-		case cs.events <- evt:
-		case <-cs.ctx.Done():
-			return
+		eventType, _ := raw["type"].(string)
+		switch eventType {
+		case "turn.completed":
+			turnCompleted = true
+			cs.refreshContextUsageFromRollout()
+			cs.flushPendingAsText()
+		case "turn.failed":
+			errMsg := ""
+			if errObj, ok := raw["error"].(map[string]any); ok {
+				errMsg, _ = errObj["message"].(string)
+			}
+			if errMsg == "" {
+				errMsg = "turn failed (no details)"
+			}
+			slog.Warn("codexSession: turn failed", "error", errMsg)
+			turnFailedErr = errMsg
+		default:
+			cs.handleEvent(raw)
 		}
+		return nil
+	})
+
+	if scanErr != nil {
+		slog.Error("codexSession: read stdout error", "error", scanErr)
+	}
+
+	waitErr := cmd.Wait()
+	cs.removeCmd(cmd)
+
+	if tid := cs.CurrentSessionID(); tid != "" {
+		patchSessionSource(tid, getenvFromList(cs.extraEnv, "CODEX_HOME"))
+	}
+
+	if cs.ctx.Err() != nil {
+		return
+	}
+
+	var terminalEvt core.Event
+	stderrMsg := strings.TrimSpace(stderrBuf.String())
+
+	if waitErr != nil {
+		if stderrMsg != "" {
+			slog.Error("codexSession: process failed with stderr", "error", waitErr, "stderr", stderrMsg)
+			terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+		} else if turnFailedErr != "" {
+			slog.Error("codexSession: process failed with turn.failed", "error", waitErr, "turn_failed", turnFailedErr)
+			terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", turnFailedErr)}
+		} else {
+			slog.Error("codexSession: process failed without stderr", "error", waitErr)
+			terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("codex process exited with error: %w", waitErr)}
+		}
+	} else if scanErr != nil {
+		slog.Error("codexSession: read stdout error", "error", scanErr)
+		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", scanErr)}
+	} else if turnFailedErr != "" {
+		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", turnFailedErr)}
+	} else if turnCompleted {
+		terminalEvt = core.Event{Type: core.EventResult, SessionID: cs.CurrentSessionID(), Done: true}
+	} else {
+		slog.Error("codexSession: process exited without terminal turn event")
+		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("codex process exited without terminal turn event")}
+	}
+
+	select {
+	case cs.events <- terminalEvt:
+	case <-cs.ctx.Done():
+		return
 	}
 }
 
@@ -395,32 +437,6 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 
 	case "item.completed":
 		cs.handleItemCompleted(raw)
-
-	case "turn.completed":
-		cs.refreshContextUsageFromRollout()
-		cs.flushPendingAsText()
-		evt := core.Event{Type: core.EventResult, SessionID: cs.CurrentSessionID(), Done: true}
-		select {
-		case cs.events <- evt:
-		case <-cs.ctx.Done():
-			return
-		}
-
-	case "turn.failed":
-		errMsg := ""
-		if errObj, ok := raw["error"].(map[string]any); ok {
-			errMsg, _ = errObj["message"].(string)
-		}
-		if errMsg == "" {
-			errMsg = "turn failed (no details)"
-		}
-		slog.Warn("codexSession: turn failed", "error", errMsg)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", errMsg)}
-		select {
-		case cs.events <- evt:
-		case <-cs.ctx.Done():
-			return
-		}
 
 	case "error":
 		msg, _ := raw["message"].(string)

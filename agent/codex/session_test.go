@@ -943,7 +943,6 @@ func TestClose_ForceKillsAllTrackedProcessesAfterCmdOverwrite(t *testing.T) {
 		t.Fatalf("Send(first): %v", err)
 	}
 	waitForThreadID(t, cs, "thread-overlap")
-	waitForDoneResult(t, cs.Events())
 
 	if err := cs.Send("second", "", nil, nil); err != nil {
 		t.Fatalf("Send(second): %v", err)
@@ -1025,3 +1024,328 @@ func waitForFileLines(t *testing.T, path string, want int) {
 	}
 	t.Fatalf("timed out waiting for %d lines in %s", want, path)
 }
+
+func TestCodexSession_EventResultBlockedUntilProcessExit(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	exitMarkerFile := filepath.Join(workDir, "exited.txt")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-delay-exit\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n" +
+		"sleep 0.3\n" +
+		"touch \"$CODEX_EXIT_MARKER\"\n"
+	powershellScript := `
+[Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-delay-exit"}')
+[Console]::Out.WriteLine('{"type":"turn.completed"}')
+Start-Sleep -Milliseconds 300
+[IO.File]::WriteAllText($env:CODEX_EXIT_MARKER, 'done')
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+
+	t.Setenv("CODEX_EXIT_MARKER", exitMarkerFile)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	select {
+	case evt, ok := <-cs.Events():
+		if !ok {
+			t.Fatal("events channel closed unexpectedly")
+		}
+		if evt.Type != core.EventResult || !evt.Done {
+			t.Fatalf("expected EventResult{Done:true}, got %+v", evt)
+		}
+	case <-timeout:
+		t.Fatal("timed out waiting for EventResult")
+	}
+
+	// When EventResult is received, the marker file MUST already exist because
+	// EventResult is only emitted after cmd.Wait() returns.
+	if _, err := os.Stat(exitMarkerFile); os.IsNotExist(err) {
+		t.Fatalf("EventResult was received BEFORE process exited and wrote marker file")
+	}
+}
+
+func TestCodexSession_TurnFailedEmittedAfterProcessExit(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-fail\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":\"custom rate limit failure\"}}'\n" +
+		"exit 0\n"
+	powershellScript := `
+[Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-fail"}')
+[Console]::Out.WriteLine('{"type":"turn.failed","error":{"message":"custom rate limit failure"}}')
+exit 0
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	var events []core.Event
+	timeout := time.After(5 * time.Second)
+	idleTimer := time.NewTimer(500 * time.Millisecond)
+	defer idleTimer.Stop()
+
+readLoop:
+	for {
+		select {
+		case evt, ok := <-cs.Events():
+			if !ok {
+				break readLoop
+			}
+			events = append(events, evt)
+			idleTimer.Reset(300 * time.Millisecond)
+		case <-idleTimer.C:
+			break readLoop
+		case <-timeout:
+			t.Fatal("timed out waiting for events")
+		}
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 terminal event, got %d: %+v", len(events), events)
+	}
+	if events[0].Type != core.EventError {
+		t.Fatalf("expected EventError, got %+v", events[0])
+	}
+	if !strings.Contains(events[0].Error.Error(), "custom rate limit failure") {
+		t.Fatalf("expected error message to contain 'custom rate limit failure', got %v", events[0].Error)
+	}
+}
+
+func TestCodexSession_ProcessErrorTakesPrecedenceOverTurnCompleted(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-crash\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n" +
+		"echo 'fatal error during teardown' >&2\n" +
+		"exit 1\n"
+	powershellScript := `
+[Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-crash"}')
+[Console]::Out.WriteLine('{"type":"turn.completed"}')
+[Console]::Error.WriteLine('fatal error during teardown')
+exit 1
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	select {
+	case evt, ok := <-cs.Events():
+		if !ok {
+			t.Fatal("events channel closed unexpectedly")
+		}
+		if evt.Type != core.EventError {
+			t.Fatalf("expected process error to take precedence, got %+v", evt)
+		}
+		if !strings.Contains(evt.Error.Error(), "fatal error during teardown") {
+			t.Fatalf("expected 'fatal error during teardown', got %v", evt.Error)
+		}
+	case <-timeout:
+		t.Fatal("timed out waiting for EventError")
+	}
+}
+
+func TestCodexSession_NonZeroExitWithoutTurnFailed_EmitsProcessError(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	script := "#!/bin/sh\n" +
+		"echo 'thread 01a018bc-44c1-7e23-8649-1f8df8475d7b already has an active writer' >&2\n" +
+		"exit 1\n"
+	powershellScript := `
+[Console]::Error.WriteLine('thread 01a018bc-44c1-7e23-8649-1f8df8475d7b already has an active writer')
+exit 1
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	select {
+	case evt, ok := <-cs.Events():
+		if !ok {
+			t.Fatal("events channel closed unexpectedly")
+		}
+		if evt.Type != core.EventError {
+			t.Fatalf("expected EventError, got %+v", evt)
+		}
+		if !strings.Contains(evt.Error.Error(), "already has an active writer") {
+			t.Fatalf("expected error to contain active writer message, got %v", evt.Error)
+		}
+	case <-timeout:
+		t.Fatal("timed out waiting for EventError")
+	}
+}
+
+func TestCodexSession_ProcessCleanExitWithoutTerminalTurnEvent_EmitsError(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-clean-no-term\"}'\n" +
+		"exit 0\n"
+	powershellScript := `
+[Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-clean-no-term"}')
+exit 0
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	select {
+	case evt, ok := <-cs.Events():
+		if !ok {
+			t.Fatal("events channel closed unexpectedly")
+		}
+		if evt.Type != core.EventError {
+			t.Fatalf("expected EventError, got %+v", evt)
+		}
+		if !strings.Contains(evt.Error.Error(), "codex process exited without terminal turn event") {
+			t.Fatalf("expected 'codex process exited without terminal turn event', got %v", evt.Error)
+		}
+	case <-timeout:
+		t.Fatal("timed out waiting for EventError")
+	}
+}
+
+func TestCodexSession_TurnCompletedThenNonZeroExit_EmitsExactlyOneEventErrorAndNoDone(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	// stdout emits turn.completed, then process exits non-zero without stderr.
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-completed-nonzero\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n" +
+		"exit 1\n"
+	powershellScript := `
+[Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-completed-nonzero"}')
+[Console]::Out.WriteLine('{"type":"turn.completed"}')
+exit 1
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	var gotError bool
+	var gotResult bool
+	var errDetails error
+
+	select {
+	case evt, ok := <-cs.Events():
+		if !ok {
+			t.Fatal("events channel closed unexpectedly")
+		}
+		if evt.Type == core.EventError {
+			gotError = true
+			errDetails = evt.Error
+		} else if evt.Type == core.EventResult {
+			gotResult = true
+		} else {
+			t.Fatalf("unexpected event type: %+v", evt)
+		}
+	case <-timeout:
+		t.Fatal("timed out waiting for event")
+	}
+
+	// Verify no subsequent event is emitted
+	select {
+	case evt, ok := <-cs.Events():
+		if ok {
+			t.Fatalf("unexpected subsequent event: %+v", evt)
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if gotResult {
+		t.Fatal("expected no EventResult, but got EventResult")
+	}
+	if !gotError {
+		t.Fatal("expected exactly 1 EventError, but got none")
+	}
+	if !strings.Contains(errDetails.Error(), "exited with error") && !strings.Contains(errDetails.Error(), "exit status 1") {
+		t.Fatalf("expected exit error, got %v", errDetails)
+	}
+}
+
+
