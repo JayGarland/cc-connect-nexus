@@ -165,6 +165,18 @@ func (p *DebouncedTelegramPlatform) DeletePreviewMessage(ctx context.Context, pr
 	return core.ErrNotSupported
 }
 
+// QuietSeparator returns the separator used in quiet mode between hidden thinking/tool
+// boundaries. Defaults to "\n" for compact Telegram output unless the underlying
+// platform provides an override.
+func (p *DebouncedTelegramPlatform) QuietSeparator() string {
+	if q, ok := p.underlying.(core.QuietSeparatorProvider); ok {
+		if sep := q.QuietSeparator(); sep != "" {
+			return sep
+		}
+	}
+	return "\n"
+}
+
 func coerceBool(v any) (bool, bool) {
 	switch x := v.(type) {
 	case bool:
@@ -234,4 +246,6 @@ var (
 	_ core.ProgressStyleProvider     = (*DebouncedTelegramPlatform)(nil)
 	_ core.CommandRegistrar          = (*DebouncedTelegramPlatform)(nil)
 	_ core.ReplyContextReconstructor = (*DebouncedTelegramPlatform)(nil)
+	_ core.QuietSeparatorProvider    = (*DebouncedTelegramPlatform)(nil)
 )
+

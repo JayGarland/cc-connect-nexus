@@ -344,6 +344,14 @@ func TestDebouncedTelegramPlatform_E2EScenarios(t *testing.T) {
 			t.Fatalf("wrapper failed ProgressStyleProvider assertion")
 		}
 
+		if quietProv, ok := wrapper.(core.QuietSeparatorProvider); ok {
+			if sep := quietProv.QuietSeparator(); sep != "\n" {
+				t.Fatalf("unexpected quiet separator: %q, want %q", sep, "\n")
+			}
+		} else {
+			t.Fatalf("wrapper failed QuietSeparatorProvider assertion")
+		}
+
 		mock.mu.Lock()
 		updateCount := len(mock.updatesSent)
 		imageCount := len(mock.imagesSent)
