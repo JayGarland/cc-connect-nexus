@@ -725,3 +725,11 @@ const (
 type PreviewStatusUpdater interface {
 	SetPreviewStatus(previewHandle any, status CardStatus)
 }
+
+// QuietSeparatorProvider is an optional interface for platforms that want to
+// customise the separator inserted between hidden thinking/tool boundaries
+// in quiet mode (e.g. "\n" instead of "\n\n").
+type QuietSeparatorProvider interface {
+	QuietSeparator() string
+}
+

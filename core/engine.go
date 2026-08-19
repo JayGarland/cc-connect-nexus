@@ -5138,9 +5138,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			//   compact: freeze+detach to split text into separate cards
 			if !e.display.ThinkingMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
-					if sp.canPreview() && sp.appendSeparator("\n\n") {
-						textParts = append(textParts, "\n\n")
+					sep := quietSeparator(p)
+					if sp.canPreview() && sp.appendSeparator(sep) {
+						textParts = append(textParts, sep)
 					}
+					segmentStart = len(textParts)
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
@@ -5225,9 +5227,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			//   compact: freeze+detach to split text into separate cards
 			if !e.display.ToolMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
-					if sp.canPreview() && sp.appendSeparator("\n\n") {
-						textParts = append(textParts, "\n\n")
+					sep := quietSeparator(p)
+					if sp.canPreview() && sp.appendSeparator(sep) {
+						textParts = append(textParts, sep)
 					}
+					segmentStart = len(textParts)
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
@@ -17099,3 +17103,15 @@ func restoreActiveProviderFromSession(agent Agent, session *Session) {
 	slog.Info("restored active provider from session",
 		"session_id", session.ID, "provider", want)
 }
+
+// quietSeparator resolves the separator used in quiet mode between thinking/tool
+// boundaries. Defaults to "\n\n" unless the platform implements QuietSeparatorProvider.
+func quietSeparator(p Platform) string {
+	if qp, ok := p.(QuietSeparatorProvider); ok {
+		if sep := qp.QuietSeparator(); sep != "" {
+			return sep
+		}
+	}
+	return "\n\n"
+}
+
