@@ -2,19 +2,25 @@ package antigravity
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -232,39 +238,33 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	if err != nil {
 		return fmt.Errorf("antigravity: cannot determine home dir: %w", err)
 	}
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", antigravityProjectSlug(a.workDir), "chats")
-	entries, err := os.ReadDir(chatsDir)
-	if err != nil {
+	baseDir := filepath.Join(homeDir, ".gemini", "antigravity-cli")
+	record, ok := findConversationRecord(baseDir, sessionID)
+	if !ok || record.ID != sessionID {
+		return fmt.Errorf("antigravity: session not found or identity mismatch: %s", sessionID)
+	}
+	if !workspaceMatches(a.workDir, record.Workspaces) {
+		return fmt.Errorf("antigravity: session %s belongs to another workDir", sessionID)
+	}
+	brainPath := filepath.Join(baseDir, "brain", sessionID)
+	dbPath := filepath.Join(baseDir, "conversations", sessionID+".db")
+	removed := false
+	if _, err := os.Stat(brainPath); err == nil {
+		if err := os.RemoveAll(brainPath); err != nil {
+			return fmt.Errorf("antigravity: remove brain: %w", err)
+		}
+		removed = true
+	}
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := os.Remove(dbPath); err != nil {
+			return fmt.Errorf("antigravity: remove conversation: %w", err)
+		}
+		removed = true
+	}
+	if !removed {
 		return fmt.Errorf("session file not found: %s", sessionID)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
-		}
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
-		if err != nil {
-			continue
-		}
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		if scanner.Scan() {
-			var sf struct {
-				SessionID string `json:"sessionId"`
-			}
-			if json.Unmarshal([]byte(scanner.Text()), &sf) == nil && sf.SessionID == sessionID {
-				_ = file.Close()
-				return os.Remove(fpath)
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			_ = file.Close()
-			continue
-		}
-		_ = file.Close()
-	}
-	return fmt.Errorf("session file not found: %s", sessionID)
+	return nil
 }
 
 func (a *Agent) Stop() error { return nil }
@@ -437,127 +437,48 @@ func slugify(s string) string {
 	return result
 }
 
-type sessionFile struct {
-	SessionID   string    `json:"sessionId"`
-	ProjectHash string    `json:"projectHash"`
-	StartTime   time.Time `json:"startTime"`
-	LastUpdated time.Time `json:"lastUpdated"`
-	Kind        string    `json:"kind"`
-}
-
-type sessionMessagePart struct {
-	Text string `json:"text"`
-}
-
-type sessionLine struct {
-	Type    string               `json:"type"` // "user", "assistant"
-	Content []sessionMessagePart `json:"content"`
-	Set     *struct {
-		LastUpdated time.Time `json:"lastUpdated"`
-	} `json:"$set"`
-}
-
 func listAntigravitySessions(workDir string) ([]core.AgentSessionInfo, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("antigravity: cannot determine home dir: %w", err)
 	}
 
-	slug := antigravityProjectSlug(workDir)
-	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", slug, "chats")
-
-	entries, err := os.ReadDir(chatsDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("antigravity: read chats dir: %w", err)
-	}
-
+	baseDir := filepath.Join(homeDir, ".gemini", "antigravity-cli")
+	records := discoverConversationRecords(baseDir)
 	var sessions []core.AgentSessionInfo
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+	for _, record := range records {
+		if !workspaceMatches(workDir, record.Workspaces) {
 			continue
 		}
-
-		fpath := filepath.Join(chatsDir, entry.Name())
-		file, err := os.Open(fpath)
+		sessionID := record.ID
+		if strings.TrimSpace(sessionID) == "" {
+			continue
+		}
+		brainDir := filepath.Join(baseDir, "brain")
+		transcriptPath := filepath.Join(brainDir, sessionID, ".system_generated", "logs", "transcript.jsonl")
+		info, err := os.Stat(transcriptPath)
 		if err != nil {
-			continue
-		}
-
-		var sf sessionFile
-		var summary string
-		msgCount := 0
-		hasUserMsg := false
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		lineNum := 0
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
+			dbPath := filepath.Join(baseDir, "conversations", sessionID+".db")
+			dbInfo, dbErr := os.Stat(dbPath)
+			if dbErr != nil {
 				continue
 			}
-
-			if lineNum == 0 {
-				if err := json.Unmarshal([]byte(line), &sf); err != nil || sf.SessionID == "" {
-					break
-				}
-				lineNum++
-				continue
-			}
-
-			var sl sessionLine
-			if json.Unmarshal([]byte(line), &sl) == nil {
-				if sl.Set != nil && !sl.Set.LastUpdated.IsZero() {
-					sf.LastUpdated = sl.Set.LastUpdated
-				} else if sl.Type != "" {
-					msgCount++
-					if sl.Type == "user" {
-						hasUserMsg = true
-						if summary == "" && len(sl.Content) > 0 {
-							text := strings.TrimSpace(sl.Content[0].Text)
-							for _, chunk := range strings.Split(text, "\n") {
-								chunk = strings.TrimSpace(chunk)
-								if chunk != "" {
-									summary = chunk
-									break
-								}
-							}
-						}
-					}
-				}
-			}
-			lineNum++
-		}
-		if err := scanner.Err(); err != nil {
-			_ = file.Close()
-			continue
-		}
-		_ = file.Close()
-
-		if sf.SessionID == "" || sf.Kind == "subagent" || !hasUserMsg {
-			continue
+			info = dbInfo
 		}
 
+		summary, msgCount := extractTranscriptInfo(transcriptPath)
 		if summary == "" {
-			summary = sf.SessionID
+			summary = sessionID
 		}
 		if utf8.RuneCountInString(summary) > 60 {
 			summary = string([]rune(summary)[:60]) + "..."
 		}
 
-		modTime := sf.LastUpdated
-		if modTime.IsZero() {
-			modTime = sf.StartTime
-		}
-
 		sessions = append(sessions, core.AgentSessionInfo{
-			ID:           sf.SessionID,
+			ID:           sessionID,
 			Summary:      summary,
 			MessageCount: msgCount,
-			ModifiedAt:   modTime,
+			ModifiedAt:   info.ModTime(),
 		})
 	}
 
@@ -566,4 +487,203 @@ func listAntigravitySessions(workDir string) ([]core.AgentSessionInfo, error) {
 	})
 
 	return sessions, nil
+}
+
+type conversationRecord struct {
+	ID         string
+	Workspaces []string
+	ModifiedAt time.Time
+}
+
+func discoverConversationRecords(baseDir string) []conversationRecord {
+	records := make(map[string]conversationRecord)
+	summaryDB := filepath.Join(baseDir, "conversation_summaries.db")
+	if db, err := sql.Open("sqlite", "file:"+summaryDB+"?mode=ro"); err == nil {
+		rows, err := db.Query("SELECT conversation_id, workspace_uris, last_modified_time FROM conversation_summaries")
+		if err == nil {
+			for rows.Next() {
+				var id, raw string
+				var modified sql.NullString
+				if rows.Scan(&id, &raw, &modified) != nil || strings.TrimSpace(id) == "" {
+					continue
+				}
+				workspaces := parseWorkspaceURIs(raw)
+				if len(workspaces) == 0 {
+					continue
+				}
+				records[id] = conversationRecord{ID: id, Workspaces: workspaces, ModifiedAt: parseTime(modified.String)}
+			}
+			_ = rows.Close()
+		}
+		_ = db.Close()
+	}
+	convDir := filepath.Join(baseDir, "conversations")
+	entries, _ := os.ReadDir(convDir)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".db")
+		if _, exists := records[id]; exists {
+			continue
+		}
+		if record, ok := readConversationRecord(filepath.Join(convDir, entry.Name()), id); ok {
+			records[id] = record
+		}
+	}
+	result := make([]conversationRecord, 0, len(records))
+	for _, record := range records {
+		result = append(result, record)
+	}
+	return result
+}
+
+func findConversationRecord(baseDir, id string) (conversationRecord, bool) {
+	for _, record := range discoverConversationRecords(baseDir) {
+		if record.ID == id {
+			return record, true
+		}
+	}
+	return conversationRecord{}, false
+}
+
+func readConversationRecord(path, filenameID string) (conversationRecord, bool) {
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		return conversationRecord{}, false
+	}
+	defer db.Close()
+	var blob []byte
+	if err := db.QueryRow("SELECT data FROM trajectory_metadata_blob WHERE id='main'").Scan(&blob); err != nil {
+		return conversationRecord{}, false
+	}
+	var meta struct {
+		ConversationID string   `json:"conversation_id"`
+		SessionID      string   `json:"session_id"`
+		WorkspaceURIs  []string `json:"workspace_uris"`
+	}
+	if json.Unmarshal(blob, &meta) == nil {
+		id := meta.ConversationID
+		if id == "" {
+			id = meta.SessionID
+		}
+		if id == "" {
+			id = filenameID
+		}
+		if id != filenameID || len(meta.WorkspaceURIs) == 0 {
+			return conversationRecord{}, false
+		}
+		return conversationRecord{ID: id, Workspaces: normalizeWorkspaceURIs(meta.WorkspaceURIs)}, true
+	}
+	workspaces := extractWorkspaceURIs(blob)
+	if len(workspaces) == 0 {
+		return conversationRecord{}, false
+	}
+	return conversationRecord{ID: filenameID, Workspaces: workspaces}, true
+}
+
+func parseWorkspaceURIs(raw string) []string {
+	var values []string
+	if json.Unmarshal([]byte(raw), &values) != nil {
+		return nil
+	}
+	return normalizeWorkspaceURIs(values)
+}
+func normalizeWorkspaceURIs(values []string) []string {
+	var result []string
+	for _, value := range values {
+		if path := canonicalWorkspacePath(value); path != "" {
+			result = append(result, path)
+		}
+	}
+	return result
+}
+func workspaceMatches(workDir string, values []string) bool {
+	target := canonicalWorkspacePath(workDir)
+	if target == "" {
+		return false
+	}
+	for _, value := range values {
+		if canonicalWorkspacePath(value) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalWorkspacePath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	for strings.Contains(value, "%") {
+		decoded, err := url.QueryUnescape(value)
+		if err != nil || decoded == value {
+			break
+		}
+		value = decoded
+	}
+	if strings.HasPrefix(strings.ToLower(value), "file://") {
+		value = strings.TrimPrefix(value, "file://")
+		value = strings.TrimPrefix(value, "/")
+	}
+	value = filepath.Clean(filepath.FromSlash(value))
+	abs, err := filepath.Abs(value)
+	if err == nil {
+		value = abs
+	}
+	return strings.ToLower(value)
+}
+
+func parseTime(value string) time.Time { t, _ := time.Parse(time.RFC3339Nano, value); return t }
+func extractWorkspaceURIs(blob []byte) []string {
+	var found []string
+	for _, match := range regexp.MustCompile(`(?i)file:///[^\x00-\x1f"']+`).FindAllString(string(blob), -1) {
+		found = append(found, match)
+	}
+	return normalizeWorkspaceURIs(found)
+}
+
+func extractTranscriptInfo(transcriptPath string) (summary string, msgCount int) {
+	file, err := os.Open(transcriptPath)
+	if err != nil {
+		return "", 0
+	}
+	defer func() { _ = file.Close() }()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		msgCount++
+
+		if summary == "" {
+			var step struct {
+				Type    string `json:"type"`
+				Content string `json:"content"`
+			}
+			if json.Unmarshal(line, &step) == nil && step.Type == "USER_INPUT" && step.Content != "" {
+				text := step.Content
+				if strings.Contains(text, "<USER_REQUEST>") && strings.Contains(text, "</USER_REQUEST>") {
+					parts := strings.Split(text, "<USER_REQUEST>")
+					if len(parts) > 1 {
+						subParts := strings.Split(parts[1], "</USER_REQUEST>")
+						text = subParts[0]
+					}
+				}
+				for _, lineStr := range strings.Split(text, "\n") {
+					lineStr = strings.TrimSpace(lineStr)
+					if lineStr != "" {
+						summary = lineStr
+						break
+					}
+				}
+			}
+		}
+	}
+	return summary, msgCount
 }
