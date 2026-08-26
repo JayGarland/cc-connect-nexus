@@ -298,6 +298,9 @@ func codexImageExt(mime string) string {
 
 func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	defer cs.wg.Done()
+	readDone := make(chan struct{})
+	defer close(readDone)
+	waitErrCh, waitDone := cs.startReadLoopWait(cmd, stdout, readDone)
 
 	var turnCompleted bool
 	var turnFailedErr string
@@ -339,10 +342,17 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 	})
 
 	if scanErr != nil {
-		slog.Error("codexSession: read stdout error", "error", scanErr)
+		select {
+		case <-cs.ctx.Done():
+			scanErr = nil
+		case <-waitDone:
+			scanErr = nil
+		default:
+			slog.Error("codexSession: read stdout error", "error", scanErr)
+		}
 	}
 
-	waitErr := cmd.Wait()
+	waitErr := <-waitErrCh
 	cs.removeCmd(cmd)
 
 	if tid := cs.CurrentSessionID(); tid != "" {
@@ -384,6 +394,37 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 	case <-cs.ctx.Done():
 		return
 	}
+}
+
+func (cs *codexSession) startReadLoopWait(cmd *exec.Cmd, stdout io.ReadCloser, readDone <-chan struct{}) (<-chan error, <-chan struct{}) {
+	waitErrCh := make(chan error, 1)
+	waitDone := make(chan struct{})
+
+	go func() {
+		waitErrCh <- cmd.Wait()
+		close(waitDone)
+	}()
+
+	go func() {
+		select {
+		case <-cs.ctx.Done():
+			_ = stdout.Close()
+			return
+		case <-waitDone:
+		}
+
+		timer := time.NewTimer(50 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-readDone:
+			return
+		case <-timer.C:
+		case <-cs.ctx.Done():
+		}
+		_ = stdout.Close()
+	}()
+
+	return waitErrCh, waitDone
 }
 
 func readJSONLines(r io.Reader, handle func([]byte) error) error {

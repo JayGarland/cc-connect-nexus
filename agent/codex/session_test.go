@@ -1,8 +1,10 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -836,6 +838,124 @@ func TestCodexSession_ContinueSessionTreatedAsFresh(t *testing.T) {
 	}
 }
 
+func TestReadLoop_ChildHoldsStdoutPipe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(pw, `{"type":"thread.started","thread_id":"test-pipe"}`+"\n")
+		writeDone <- err
+	}()
+
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	cmd.Stdout = pw
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := &codexSession{
+		events: make(chan core.Event, 64),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	cs.alive.Store(true)
+	cs.wg.Add(1)
+	go cs.readLoop(cmd, pr, &stderrBuf)
+
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out writing test event")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && cs.CurrentSessionID() != "test-pipe" {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cs.CurrentSessionID() != "test-pipe" {
+		t.Fatal("timed out receiving thread.started")
+	}
+
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventError && evt.Type != core.EventResult {
+			t.Fatalf("expected terminal event after child-held stdout is released, got %+v", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HANG: readLoop remained blocked on inherited stdout")
+	}
+	if err := cs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case _, ok := <-cs.events:
+		if ok {
+			t.Fatal("expected events channel to close after session Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("events channel remained open after session Close")
+	}
+}
+
+func TestReadLoop_CtxCancelClosesChannels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		cancel()
+		_ = pw.Close()
+	})
+
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := &codexSession{
+		events: make(chan core.Event, 64),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	cs.alive.Store(true)
+	cs.wg.Add(1)
+	go cs.readLoop(cmd, pr, &stderrBuf)
+
+	readDone := make(chan struct{})
+	go func() {
+		cs.wg.Wait()
+		close(readDone)
+	}()
+	cancel()
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HANG: readLoop remained blocked after context cancellation")
+	}
+	if err := cs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case _, ok := <-cs.events:
+		if ok {
+			t.Fatal("expected events channel to close after session Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("events channel remained open after session Close")
+	}
+}
+
 func TestClose_ForceKillsProcessGroupAfterGracefulTimeout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process-group semantics differ on windows")
@@ -1347,5 +1467,3 @@ exit 1
 		t.Fatalf("expected exit error, got %v", errDetails)
 	}
 }
-
-
