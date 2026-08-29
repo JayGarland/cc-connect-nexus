@@ -28,6 +28,7 @@ type opencodeSession struct {
 	extraArgs         []string // extra args from cmd, prepended before opencode args
 	workDir           string
 	model             string
+	variant           string
 	mode              string
 	agentName         string
 	extraEnv          []string
@@ -39,9 +40,10 @@ type opencodeSession struct {
 	alive             atomic.Bool
 	expectingContinue atomic.Bool // true when compaction_continue received, waiting for next step
 	resultSent        atomic.Bool // true when EventResult has been sent for this turn
+	pendingStop       atomic.Bool // true when step_finish reason=stop seen, pending Wait before emitting EventResult
 }
 
-func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, agentName, resumeID string, extraEnv []string) (*opencodeSession, error) {
+func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, agentName, resumeID string, extraEnv []string, variant string) (*opencodeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	s := &opencodeSession{
@@ -49,6 +51,7 @@ func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, wor
 		extraArgs: extraArgs,
 		workDir:   workDir,
 		model:     model,
+		variant:   variant,
 		mode:      mode,
 		agentName: agentName,
 		extraEnv:  extraEnv,
@@ -80,6 +83,7 @@ func (s *opencodeSession) Send(prompt string, messageID string, images []core.Im
 
 	s.resultSent.Store(false)
 	s.expectingContinue.Store(false)
+	s.pendingStop.Store(false)
 
 	chatID := s.CurrentSessionID()
 	isResume := chatID != ""
@@ -171,6 +175,9 @@ func (s *opencodeSession) buildRunArgs(prompt string, imagePaths []string, chatI
 	if s.workDir != "" {
 		args = append(args, "--dir", s.workDir)
 	}
+	if s.variant != "" {
+		args = append(args, "--variant", s.variant)
+	}
 
 	// Enable thinking blocks.
 	args = append(args, "--thinking")
@@ -191,47 +198,147 @@ func (s *opencodeSession) buildRunArgs(prompt string, imagePaths []string, chatI
 	return args
 }
 
+// opencodeReadDrainGrace bounds how long readLoop waits for buffered stdout
+// to drain after the opencode process itself has already exited (confirmed
+// via cmd.Wait(), signaled by waitDone below). It only starts counting once
+// the process is known dead, so it can never cut off a turn that is still
+// genuinely running — only a stdout pipe stuck open because a detached
+// grandchild still holds a handle to it, which Windows cannot cancel by
+// closing our end (mirrors agent/codex/session.go's codexReadDrainGrace).
+var opencodeReadDrainGrace = 5 * time.Second
+
 func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	defer s.wg.Done()
-	defer func() { _ = cmd.Wait() }()
+	readDone := make(chan struct{})
+	waitErrCh, waitDone := s.startReadLoopWait(cmd, stdout, readDone)
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	var stateMu sync.Mutex
+	var scanErr error
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
+	// Scanning runs in its own wg-tracked goroutine so this function can stop
+	// waiting on it once the process is confirmed dead, without racing
+	// Close()'s events-channel shutdown (Close() only closes s.events after
+	// s.wg.Wait() succeeds; if wg.Wait() times out instead, close is skipped
+	// entirely, so a still-running abandoned goroutine can never send on an
+	// already-closed channel).
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer close(readDone)
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+
+			var raw map[string]any
+			if err := json.Unmarshal([]byte(line), &raw); err != nil {
+				slog.Debug("opencodeSession: non-JSON line", "line", line)
+				continue
+			}
+
+			s.handleEvent(raw)
 		}
+		stateMu.Lock()
+		scanErr = scanner.Err()
+		stateMu.Unlock()
+	}()
 
-		var raw map[string]any
-		if err := json.Unmarshal([]byte(line), &raw); err != nil {
-			slog.Debug("opencodeSession: non-JSON line", "line", line)
-			continue
+	stuck := false
+	select {
+	case <-readDone:
+		// Normal path: stdout hit EOF on its own.
+	case <-s.ctx.Done():
+	case <-waitDone:
+		// The opencode process itself has already exited. Give already-
+		// buffered output a short grace window to drain, then stop waiting
+		// on the reader instead of blocking forever behind a lingering
+		// grandchild's pipe handle.
+		select {
+		case <-readDone:
+		case <-s.ctx.Done():
+		case <-time.After(opencodeReadDrainGrace):
+			stuck = true
+			slog.Warn("opencodeSession: process exited but its output stream is still blocked after grace period; a lingering child process likely still holds the pipe open — reporting best-known turn state and abandoning the stuck reader",
+				"grace", opencodeReadDrainGrace)
 		}
-
-		s.handleEvent(raw)
 	}
 
-	if err := scanner.Err(); err != nil {
-		slog.Error("opencodeSession: scanner error", "error", err)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
+	stateMu.Lock()
+	scanErrSnapshot := scanErr
+	stateMu.Unlock()
+
+	if scanErrSnapshot != nil {
+		select {
+		case <-s.ctx.Done():
+			scanErrSnapshot = nil
+		case <-waitDone:
+			scanErrSnapshot = nil
+		default:
+			slog.Error("opencodeSession: scanner error", "error", scanErrSnapshot)
+		}
+	}
+
+	waitErr := <-waitErrCh
+
+	if s.ctx.Err() != nil {
+		return
+	}
+
+	if stuck {
+		// Unlike the normal fallback below, we genuinely do not know whether
+		// this turn succeeded — do not let the no-error-seen fallback below
+		// mistake this for success.
+		slog.Error("opencodeSession: process exited but its final output could not be read before the stuck reader was abandoned")
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("opencode process exited but its output stream stayed blocked (likely a lingering child process still holds the output pipe open)")}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():
-			return
+		}
+		s.pendingStop.Store(false)
+		return
+	}
+
+	// Prioritize wait error / scan error over fallback; mirroring codex/claudecode pattern:
+	// waitErr and scanErr are terminal, but waitDone/ctx suppression already applied above.
+	if scanErrSnapshot != nil {
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", scanErrSnapshot)}
+		select {
+		case s.events <- evt:
+		case <-s.ctx.Done():
 		}
 		return
 	}
 
-	stderrMsg := stderrBuf.String()
+	stderrMsg := strings.TrimSpace(stderrBuf.String())
 	if stderrMsg != "" {
-		slog.Error("opencodeSession: process error", "stderr", truncate(stderrMsg, 500))
-		if strings.Contains(stderrMsg, "Session not found") {
-			s.chatID.Store("")
-			slog.Warn("opencodeSession: cleared stale session ID")
+		// Treat stderr as error only if we haven't already sent a result and no successful turn completion is pending.
+		// If expectingContinue, suppress stderr-driven error (compaction continuation is not an error).
+		if s.expectingContinue.Load() {
+			slog.Info("opencodeSession: readLoop ended after compaction_continue, skipping EventResult despite stderr", "session_id", s.CurrentSessionID(), "stderr", truncate(stderrMsg, 500))
+			s.expectingContinue.Store(false)
+			return
 		}
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+		if waitErr != nil || !s.resultSent.Load() {
+			slog.Error("opencodeSession: process error", "stderr", truncate(stderrMsg, 500), "waitErr", waitErr)
+			if strings.Contains(stderrMsg, "Session not found") {
+				s.chatID.Store("")
+				slog.Warn("opencodeSession: cleared stale session ID")
+			}
+			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+			select {
+			case s.events <- evt:
+			case <-s.ctx.Done():
+			}
+			return
+		}
+	}
+	if waitErr != nil {
+		slog.Error("opencodeSession: process failed", "error", waitErr, "stderr", truncate(stderrMsg, 500))
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("opencode process exited with error: %w", waitErr)}
 		select {
 		case s.events <- evt:
 		case <-s.ctx.Done():
@@ -245,11 +352,47 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 	if s.expectingContinue.Load() {
 		slog.Info("opencodeSession: readLoop ended after compaction_continue, skipping EventResult", "session_id", s.CurrentSessionID())
 		s.expectingContinue.Store(false)
+		s.pendingStop.Store(false)
 		return
 	}
 
-	slog.Debug("opencodeSession: readLoop complete, sending fallback EventResult", "session_id", s.CurrentSessionID())
-	s.sendEventResult()
+	// Only send fallback if no terminal event was already emitted (now deferred until after Wait).
+	if !s.resultSent.Load() {
+		slog.Debug("opencodeSession: readLoop complete, sending fallback EventResult", "session_id", s.CurrentSessionID())
+		s.sendEventResult()
+	}
+	s.pendingStop.Store(false)
+}
+
+func (s *opencodeSession) startReadLoopWait(cmd *exec.Cmd, stdout io.ReadCloser, readDone <-chan struct{}) (<-chan error, <-chan struct{}) {
+	waitErrCh := make(chan error, 1)
+	waitDone := make(chan struct{})
+
+	go func() {
+		waitErrCh <- cmd.Wait()
+		close(waitDone)
+	}()
+
+	go func() {
+		select {
+		case <-s.ctx.Done():
+			_ = stdout.Close()
+			return
+		case <-waitDone:
+		}
+
+		timer := time.NewTimer(50 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-readDone:
+			return
+		case <-timer.C:
+		case <-s.ctx.Done():
+		}
+		_ = stdout.Close()
+	}()
+
+	return waitErrCh, waitDone
 }
 
 // OpenCode NDJSON event structure:
@@ -488,7 +631,9 @@ func (s *opencodeSession) handleStepFinish(raw map[string]any) {
 	slog.Debug("opencodeSession: step finished", "reason", reason, "session_id", s.CurrentSessionID())
 
 	if reason == "stop" {
-		s.sendEventResult()
+		// Defer EventResult until readLoop's Wait completes (mirrors codex ca5f863).
+		// Previously this sent immediately while the child process was still alive → race/stall.
+		s.pendingStop.Store(true)
 	}
 }
 

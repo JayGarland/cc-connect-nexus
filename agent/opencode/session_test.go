@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -61,7 +60,7 @@ func TestOpencodeSessionEntry_Unmarshal(t *testing.T) {
 // the ContinueSession sentinel (__continue__) is not passed as a literal
 // session ID to the CLI. This was fixed in PR #249.
 func TestNewOpencodeSession_ContinueSessionTreatedAsFresh(t *testing.T) {
-	s, err := newOpencodeSession(context.Background(), "echo", nil, "/tmp", "", "default", "", core.ContinueSession, nil)
+	s, err := newOpencodeSession(context.Background(), "echo", nil, "/tmp", "", "default", "", core.ContinueSession, nil, "")
 	if err != nil {
 		t.Fatalf("newOpencodeSession: %v", err)
 	}
@@ -120,6 +119,22 @@ func TestOpencodeSessionBuildRunArgsIncludesImagesAsFiles(t *testing.T) {
 	}
 }
 
+func TestOpencodeSessionBuildRunArgsIncludesVariant(t *testing.T) {
+	s := &opencodeSession{workDir: "/repo", model: "sadai/gpt-5.6-terra", variant: "xhigh"}
+
+	got := s.buildRunArgs("continue the task", nil, "")
+	want := []string{
+		"run", "--format", "json",
+		"--model", "sadai/gpt-5.6-terra",
+		"--dir", "/repo",
+		"--variant", "xhigh",
+		"--thinking",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 // TestHandleStepStart_SessionIDFromTopLevel verifies that handleStepStart
 // prefers the sessionID from the top-level JSON field when both top-level
 // and part-level sessionID are present. This matches OpenCode's stdout format.
@@ -159,7 +174,13 @@ func TestHandleStepStart_SessionIDFromPart(t *testing.T) {
 
 // TestHandleStepStopSendsEventResult verifies that handleStepFinish sends
 // an EventResult when reason="stop", signaling turn completion to the engine.
-func TestHandleStepStopSendsEventResult(t *testing.T) {
+// TestHandleStepStopDefersEventResult verifies that handleStepFinish no
+// longer sends EventResult immediately on reason="stop" — it only marks
+// pendingStop, deferring the actual EventResult until readLoop confirms the
+// process has exited (see readLoop's fallback sendEventResult() call, and
+// the codex ca5f863 fix this mirrors). Sending immediately here previously
+// raced against the still-running child process.
+func TestHandleStepStopDefersEventResult(t *testing.T) {
 	jsonData := `{"type":"step_finish","part":{"reason":"stop"}}`
 
 	var raw map[string]any
@@ -172,16 +193,13 @@ func TestHandleStepStopSendsEventResult(t *testing.T) {
 	s := &opencodeSession{events: make(chan core.Event, 1), ctx: ctx}
 	s.handleStepFinish(raw)
 
+	if !s.pendingStop.Load() {
+		t.Error("expected pendingStop to be true after reason=stop")
+	}
 	select {
 	case evt := <-s.events:
-		if evt.Type != core.EventResult {
-			t.Errorf("event type = %q, want EventResult", evt.Type)
-		}
-		if !evt.Done {
-			t.Errorf("event.Done = false, want true")
-		}
+		t.Errorf("expected no EventResult sent yet, got %v", evt)
 	default:
-		t.Error("expected EventResult to be sent when reason=stop")
 	}
 }
 
@@ -209,26 +227,20 @@ func TestHandleStepToolCallsNoEventResult(t *testing.T) {
 }
 
 // TestHandleStepDuplicateEventResultPrevented verifies that calling
-// handleStepFinish multiple times with reason="stop" only sends one
-// EventResult, preventing duplicate completion signals to the engine.
+// sendEventResult multiple times only sends one EventResult, preventing
+// duplicate completion signals to the engine. The guard now lives in
+// sendEventResult itself (resultSent), since handleStepFinish no longer
+// sends EventResult directly — see TestHandleStepStopDefersEventResult.
 func TestHandleStepDuplicateEventResultPrevented(t *testing.T) {
-	jsonData := `{"type":"step_finish","part":{"reason":"stop"}}`
-
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(jsonData), &raw); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &opencodeSession{
-		events:     make(chan core.Event, 2),
-		ctx:        ctx,
-		resultSent: atomic.Bool{},
+		events: make(chan core.Event, 2),
+		ctx:    ctx,
 	}
 
-	s.handleStepFinish(raw)
-	s.handleStepFinish(raw)
+	s.sendEventResult()
+	s.sendEventResult()
 
 	count := 0
 	for len(s.events) > 0 {

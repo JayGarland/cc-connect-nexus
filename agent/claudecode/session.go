@@ -531,17 +531,71 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	return cs, nil
 }
 
+// claudeReadDrainGrace bounds how long readLoop waits for buffered stdout to
+// drain after the claude process itself has already exited (confirmed via
+// cmd.Wait(), signaled by waitDone below). It only starts counting once the
+// process is known dead, so it can never cut off a turn that is still
+// genuinely running — only a stdout pipe stuck open because a detached
+// grandchild (e.g. an MCP server or build tool the agent spawned) still
+// holds a handle to it, which Windows cannot cancel by closing our end.
+// Claude Code emits its terminal "result" event in real time as the line is
+// scanned (handleResult), so a stuck pipe here does not delay the user's
+// answer — it only prevents this session from ever reporting itself fully
+// done (cs.done), which would otherwise hang a later Close()'s SIGKILL wait.
+var claudeReadDrainGrace = 5 * time.Second
+
 func (cs *claudeSession) readLoop(stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	waitErrCh, waitDone := cs.startReadLoopWait(stdout)
-	defer cs.finishReadLoop(waitErrCh, stderrBuf)
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-	for scanner.Scan() {
-		cs.handleReadLoopLine(scanner.Text())
+	readDone := make(chan struct{})
+	var scanErrMu sync.Mutex
+	var scanErr error
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// This goroutine may be abandoned below (grace period expired)
+				// while the session is torn down and cs.events/cs.done get
+				// closed. If it later wakes up on stale buffered data and
+				// tries to send, recover here rather than crashing the process.
+				slog.Error("claudeSession: recovered panic in abandoned reader goroutine", "recover", r)
+			}
+		}()
+		defer close(readDone)
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+		for scanner.Scan() {
+			cs.handleReadLoopLine(scanner.Text())
+		}
+		scanErrMu.Lock()
+		scanErr = scanner.Err()
+		scanErrMu.Unlock()
+	}()
+
+	select {
+	case <-readDone:
+		// Normal path: stdout hit EOF on its own.
+	case <-cs.ctx.Done():
+	case <-waitDone:
+		// The claude process itself has already exited. Give already-buffered
+		// output a short grace window to drain, then stop waiting on the
+		// reader instead of blocking forever behind a lingering grandchild's
+		// pipe handle.
+		select {
+		case <-readDone:
+		case <-cs.ctx.Done():
+		case <-time.After(claudeReadDrainGrace):
+			slog.Warn("claudeSession: process exited but its output stream is still blocked after grace period; a lingering child process likely still holds the pipe open — finishing the session and abandoning the stuck reader",
+				"grace", claudeReadDrainGrace)
+		}
 	}
 
-	cs.handleReadLoopScanErr(scanner.Err(), waitDone)
+	scanErrMu.Lock()
+	finalScanErr := scanErr
+	scanErrMu.Unlock()
+
+	cs.handleReadLoopScanErr(finalScanErr, waitDone)
+	cs.finishReadLoop(waitErrCh, stderrBuf)
 }
 
 func (cs *claudeSession) startReadLoopWait(stdout io.ReadCloser) (<-chan error, <-chan struct{}) {

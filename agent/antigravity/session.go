@@ -317,31 +317,23 @@ func (as *antigravitySession) handleStreamEvent(ev *agyStreamLine, hasEmittedTex
 	}
 }
 
+// antigravityReadDrainGrace bounds how long readLoop waits for buffered
+// stdout to drain after the agy process itself has already exited (confirmed
+// via cmd.Wait(), signaled by waitDone below). It only starts counting once
+// the process is known dead, so it can never cut off a turn that is still
+// genuinely running — only a stdout pipe stuck open because a detached
+// grandchild still holds a handle to it, which Windows cannot cancel by
+// closing our end (mirrors agent/codex/session.go's codexReadDrainGrace).
+var antigravityReadDrainGrace = 5 * time.Second
+
 func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempFiles []string) {
 	defer as.wg.Done()
-	defer func() {
-		for _, f := range tempFiles {
-			_ = os.Remove(f)
-		}
 
-		err := cmd.Wait()
-		sid := as.CurrentSessionID()
-		if err != nil {
-			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
-				slog.Error("antigravitySession: process failed", "error", err, "stderr", stderrMsg)
-				select {
-				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
-				case <-as.ctx.Done():
-				}
-			}
-		}
-
-		// Finalize turn.
-		select {
-		case as.events <- core.Event{Type: core.EventResult, SessionID: sid, Done: true}:
-		case <-as.ctx.Done():
-		}
+	waitErrCh := make(chan error, 1)
+	waitDone := make(chan struct{})
+	go func() {
+		waitErrCh <- cmd.Wait()
+		close(waitDone)
 	}()
 
 	go func() {
@@ -349,34 +341,98 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		_ = stdout.Close()
 	}()
 
-	reader := bufio.NewReader(stdout)
-	var hasEmittedText bool
+	readDone := make(chan struct{})
+	// Reading runs in its own wg-tracked goroutine so this function can stop
+	// waiting on it once the process is confirmed dead, without racing
+	// Close()'s events-channel shutdown — Close() only closes as.events after
+	// as.wg.Wait() succeeds (in its own background goroutine, independent of
+	// Close()'s own 8s timeout), so an abandoned goroutine can never send on
+	// an already-closed channel.
+	as.wg.Add(1)
+	go func() {
+		defer as.wg.Done()
+		defer close(readDone)
+		reader := bufio.NewReader(stdout)
+		var hasEmittedText bool
 
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			ev, rawText, isJSON := parseAgyStreamLine(line)
-			if isJSON && ev != nil {
-				as.handleStreamEvent(ev, &hasEmittedText)
-			} else if rawText != "" {
-				hasEmittedText = true
-				select {
-				case as.events <- core.Event{Type: core.EventText, Content: rawText}:
-				case <-as.ctx.Done():
-					return
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				ev, rawText, isJSON := parseAgyStreamLine(line)
+				if isJSON && ev != nil {
+					as.handleStreamEvent(ev, &hasEmittedText)
+				} else if rawText != "" {
+					hasEmittedText = true
+					select {
+					case as.events <- core.Event{Type: core.EventText, Content: rawText}:
+					case <-as.ctx.Done():
+						return
+					}
 				}
 			}
-		}
-		if err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "file already closed") {
-				slog.Error("antigravitySession: read error", "error", err)
-				select {
-				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}:
-				case <-as.ctx.Done():
+			if err != nil {
+				if err != io.EOF && !strings.Contains(err.Error(), "file already closed") {
+					slog.Error("antigravitySession: read error", "error", err)
+					select {
+					case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}:
+					case <-as.ctx.Done():
+					}
 				}
+				return
 			}
-			return
 		}
+	}()
+
+	stuck := false
+	select {
+	case <-readDone:
+		// Normal path: stdout hit EOF on its own.
+	case <-as.ctx.Done():
+	case <-waitDone:
+		// The agy process itself has already exited. Give already-buffered
+		// output a short grace window to drain, then stop waiting on the
+		// reader instead of blocking forever behind a lingering grandchild's
+		// pipe handle.
+		select {
+		case <-readDone:
+		case <-as.ctx.Done():
+		case <-time.After(antigravityReadDrainGrace):
+			stuck = true
+			slog.Warn("antigravitySession: process exited but its output stream is still blocked after grace period; a lingering child process likely still holds the pipe open — finishing the turn and abandoning the stuck reader",
+				"grace", antigravityReadDrainGrace)
+		}
+	}
+
+	for _, f := range tempFiles {
+		_ = os.Remove(f)
+	}
+
+	waitErr := <-waitErrCh
+	sid := as.CurrentSessionID()
+
+	if stuck {
+		slog.Error("antigravitySession: process exited but its final output could not be read before the stuck reader was abandoned")
+		select {
+		case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("antigravity process exited but its output stream stayed blocked (likely a lingering child process still holds the output pipe open)")}:
+		case <-as.ctx.Done():
+		}
+	} else if waitErr != nil {
+		stderrMsg := strings.TrimSpace(stderrBuf.String())
+		if stderrMsg != "" {
+			slog.Error("antigravitySession: process failed", "error", waitErr, "stderr", stderrMsg)
+			select {
+			case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
+			case <-as.ctx.Done():
+			}
+		}
+	}
+
+	// Finalize turn. Always sent (even after the stuck/error cases above,
+	// matching the pre-existing contract) so the engine never waits forever
+	// for a Done signal that only the happy path used to guarantee.
+	select {
+	case as.events <- core.Event{Type: core.EventResult, SessionID: sid, Done: true}:
+	case <-as.ctx.Done():
 	}
 }
 

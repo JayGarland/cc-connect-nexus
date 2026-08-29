@@ -60,6 +60,15 @@ type codexSession struct {
 
 var codexSessionCloseTimeout = 8 * time.Second
 var codexSessionForceKillWait = 2 * time.Second
+
+// codexReadDrainGrace bounds how long readLoop waits for buffered stdout to
+// drain after codex.exe itself has already exited (confirmed via cmd.Wait()).
+// It only starts counting once the process is known dead, so it can never
+// cut off a turn that is still genuinely running — only a stdout pipe stuck
+// open because a detached grandchild (e.g. a Gradle daemon) still holds a
+// handle to it, which Windows cannot cancel by closing our end (see
+// agent/codex/proc_windows.go: no Job Object, so grandchildren aren't tracked).
+var codexReadDrainGrace = 5 * time.Second
 var codexRuntimeConfigCacheTTL = 5 * time.Second
 var codexRuntimeConfigTimeout = 1500 * time.Millisecond
 var codexContextUsageRetryDelay = 50 * time.Millisecond
@@ -317,56 +326,83 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 	// Wait/removeCmd/patchSessionSource sequence further down.
 	defer cs.turnInFlight.Store(false)
 	readDone := make(chan struct{})
-	defer close(readDone)
 	waitErrCh, waitDone := cs.startReadLoopWait(cmd, stdout, readDone)
 
+	var stateMu sync.Mutex
 	var turnCompleted bool
 	var turnFailedErr string
+	var scanErr error
 
-	scanErr := readJSONLines(stdout, func(line []byte) error {
-		lineText := string(line)
-		if lineText == "" {
-			return nil
-		}
-
-		slog.Debug("codexSession: raw", "line", truncate(lineText, 500))
-
-		var raw map[string]any
-		if err := json.Unmarshal(line, &raw); err != nil {
-			slog.Debug("codexSession: non-JSON line", "line", lineText)
-			return nil
-		}
-
-		eventType, _ := raw["type"].(string)
-		switch eventType {
-		case "turn.completed":
-			turnCompleted = true
-			cs.refreshContextUsageFromRollout()
-			cs.flushPendingAsText()
-		case "turn.failed":
-			errMsg := ""
-			if errObj, ok := raw["error"].(map[string]any); ok {
-				errMsg, _ = errObj["message"].(string)
+	// Scanning runs in its own wg-tracked goroutine so this function can stop
+	// waiting on it once codex.exe is confirmed dead, without racing Close()'s
+	// events-channel shutdown (Close() already defers close(cs.events) until
+	// every cs.wg goroutine — including this one, if abandoned — has exited).
+	cs.wg.Add(1)
+	go func() {
+		defer cs.wg.Done()
+		defer close(readDone)
+		err := readJSONLines(stdout, func(line []byte) error {
+			lineText := string(line)
+			if lineText == "" {
+				return nil
 			}
-			if errMsg == "" {
-				errMsg = "turn failed (no details)"
-			}
-			slog.Warn("codexSession: turn failed", "error", errMsg)
-			turnFailedErr = errMsg
-		default:
-			cs.handleEvent(raw)
-		}
-		return nil
-	})
 
-	if scanErr != nil {
+			slog.Debug("codexSession: raw", "line", truncate(lineText, 500))
+
+			var raw map[string]any
+			if jsonErr := json.Unmarshal(line, &raw); jsonErr != nil {
+				slog.Debug("codexSession: non-JSON line", "line", lineText)
+				return nil
+			}
+
+			eventType, _ := raw["type"].(string)
+			switch eventType {
+			case "turn.completed":
+				stateMu.Lock()
+				turnCompleted = true
+				stateMu.Unlock()
+				cs.refreshContextUsageFromRollout()
+				cs.flushPendingAsText()
+			case "turn.failed":
+				errMsg := ""
+				if errObj, ok := raw["error"].(map[string]any); ok {
+					errMsg, _ = errObj["message"].(string)
+				}
+				if errMsg == "" {
+					errMsg = "turn failed (no details)"
+				}
+				slog.Warn("codexSession: turn failed", "error", errMsg)
+				stateMu.Lock()
+				turnFailedErr = errMsg
+				stateMu.Unlock()
+			default:
+				cs.handleEvent(raw)
+			}
+			return nil
+		})
+		stateMu.Lock()
+		scanErr = err
+		stateMu.Unlock()
+	}()
+
+	stuck := false
+	select {
+	case <-readDone:
+		// Normal path: stdout hit EOF on its own.
+	case <-cs.ctx.Done():
+		return
+	case <-waitDone:
+		// codex.exe itself has already exited. Give already-buffered output a
+		// short grace window to drain, then stop waiting on the reader instead
+		// of blocking forever behind a lingering grandchild's pipe handle.
 		select {
+		case <-readDone:
 		case <-cs.ctx.Done():
-			scanErr = nil
-		case <-waitDone:
-			scanErr = nil
-		default:
-			slog.Error("codexSession: read stdout error", "error", scanErr)
+			return
+		case <-time.After(codexReadDrainGrace):
+			stuck = true
+			slog.Warn("codexSession: codex process exited but its output stream is still blocked after grace period; a lingering child process (e.g. a build daemon) likely still holds the pipe open — reporting best-known turn state and abandoning the stuck reader",
+				"grace", codexReadDrainGrace)
 		}
 	}
 
@@ -381,28 +417,42 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 		return
 	}
 
+	stateMu.Lock()
+	turnCompletedSnapshot := turnCompleted
+	turnFailedSnapshot := turnFailedErr
+	scanErrSnapshot := scanErr
+	stateMu.Unlock()
+
+	// By this point codex.exe's exit is already confirmed (waitErr above), so
+	// a read error here is just the expected side effect of that exit, not a
+	// standalone failure worth surfacing.
+	if scanErrSnapshot != nil {
+		slog.Debug("codexSession: stdout read ended with error after process exit (expected)", "error", scanErrSnapshot)
+	}
+
 	var terminalEvt core.Event
 	stderrMsg := strings.TrimSpace(stderrBuf.String())
 
-	if waitErr != nil {
+	switch {
+	case waitErr != nil:
 		if stderrMsg != "" {
 			slog.Error("codexSession: process failed with stderr", "error", waitErr, "stderr", stderrMsg)
 			terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-		} else if turnFailedErr != "" {
-			slog.Error("codexSession: process failed with turn.failed", "error", waitErr, "turn_failed", turnFailedErr)
-			terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", turnFailedErr)}
+		} else if turnFailedSnapshot != "" {
+			slog.Error("codexSession: process failed with turn.failed", "error", waitErr, "turn_failed", turnFailedSnapshot)
+			terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", turnFailedSnapshot)}
 		} else {
 			slog.Error("codexSession: process failed without stderr", "error", waitErr)
 			terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("codex process exited with error: %w", waitErr)}
 		}
-	} else if scanErr != nil {
-		slog.Error("codexSession: read stdout error", "error", scanErr)
-		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", scanErr)}
-	} else if turnFailedErr != "" {
-		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", turnFailedErr)}
-	} else if turnCompleted {
+	case turnFailedSnapshot != "":
+		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("%s", turnFailedSnapshot)}
+	case turnCompletedSnapshot:
 		terminalEvt = core.Event{Type: core.EventResult, SessionID: cs.CurrentSessionID(), Done: true}
-	} else {
+	case stuck:
+		slog.Error("codexSession: codex process exited but its final output could not be read before the stuck reader was abandoned")
+		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("codex process exited but its output stream stayed blocked (likely a lingering child process still holds the output pipe open)")}
+	default:
 		slog.Error("codexSession: process exited without terminal turn event")
 		terminalEvt = core.Event{Type: core.EventError, Error: fmt.Errorf("codex process exited without terminal turn event")}
 	}
