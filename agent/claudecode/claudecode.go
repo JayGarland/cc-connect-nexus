@@ -25,6 +25,29 @@ func init() {
 	core.RegisterAgent("claudecode", New)
 }
 
+var interactiveQuotaWallPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)you'?ve hit your session limit`),
+	regexp.MustCompile(`(?i)you have hit your session limit`),
+	regexp.MustCompile(`(?i)session limit reached`),
+	regexp.MustCompile(`(?i)you'?ve hit your monthly spend limit`),
+	regexp.MustCompile(`(?i)monthly spend limit`),
+}
+
+// IsInteractiveQuotaWall reports whether Claude Code ended an interactive
+// turn because the configured provider quota was exhausted.
+func (a *Agent) IsInteractiveQuotaWall(errorText string) bool {
+	text := strings.TrimSpace(errorText)
+	if text == "" || utf8.RuneCountInString(text) > 400 {
+		return false
+	}
+	for _, pattern := range interactiveQuotaWallPatterns {
+		if pattern.MatchString(text) {
+			return true
+		}
+	}
+	return false
+}
+
 // Agent drives Claude Code CLI using --input-format stream-json
 // and --permission-prompt-tool stdio for bidirectional communication.
 //

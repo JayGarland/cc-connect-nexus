@@ -964,7 +964,6 @@ func (e *Engine) FallbackProviders() []string {
 	return e.fallbackProviders
 }
 
-
 // estimateTokens provides a rough token estimate for a set of history entries.
 func estimateTokens(entries []HistoryEntry) int {
 	return estimateTokensWithPendingAssistant(entries, "")
@@ -1736,7 +1735,8 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 								"job", job.ID, "to", decision.NextProvider, "session", runSessionKey)
 							// Retry once in a fresh side session
 							retrySession := sessions.NewSideSession(runSessionKey, "cron-"+job.ID+"-failover")
-							if !retrySession.TryLock() {
+							retryLockGen, retryLocked := retrySession.TryLock()
+							if !retryLocked {
 								e.cleanupInteractiveState(iKey)
 								return fmt.Errorf("cron job %q: failover retry session busy", job.ID)
 							}
@@ -1745,7 +1745,7 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 								retryIKey = workspaceDir + ":" + retryIKey
 							}
 							prevRetryLen := retrySession.HistoryLen()
-							e.processInteractiveMessageWith(effectivePlatform, msg, retrySession, agent, sessions, retryIKey, workspaceDir, runSessionKey)
+							e.processInteractiveMessageWith(effectivePlatform, msg, retrySession, agent, sessions, retryIKey, workspaceDir, runSessionKey, retryLockGen)
 							e.cleanupInteractiveState(retryIKey)
 
 							retryEmpty := retrySession.HistoryLen() < prevRetryLen+2
@@ -4027,6 +4027,11 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // It accepts an explicit agent, interactiveKey (for the interactiveStates map),
 // and workspaceDir so that multi-workspace mode can route to per-workspace agents.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY in the agent env; otherwise interactiveKey is used.
+type interactiveTurnResult struct {
+	quotaWall bool
+	err       error
+}
+
 // lockGen is the generation returned by the TryLock that acquired this turn's
 // busy lock; it must be passed to every session.Unlock of this turn (custom 2026-09-12).
 func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string, lockGen uint64) {
@@ -4141,31 +4146,64 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
 
-	sendStart := time.Now()
-	state.mu.Lock()
-	state.currentMessageID = msg.MessageID
-	state.fromVoice = msg.FromVoice
-	state.sideText = ""
-	as := state.agentSession // capture under lock to avoid race with cleanup
-	state.mu.Unlock()
+	failoverAttempted := false
+	for {
+		sendStart := time.Now()
+		state.mu.Lock()
+		state.currentMessageID = msg.MessageID
+		state.fromVoice = msg.FromVoice
+		state.sideText = ""
+		as := state.agentSession // capture under lock to avoid race with cleanup
+		state.mu.Unlock()
 
-	// Run Send concurrently with processInteractiveEvents. Some agents block inside
-	// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
-	// EventPermissionRequest while blocked — the event loop must run in parallel.
-	sendDone := make(chan error, 1)
-	go func() {
-		if as == nil {
-			sendDone <- fmt.Errorf("agent session became nil")
-			return
+		// Run Send concurrently with processInteractiveEvents. Some agents block inside
+		// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
+		// EventPermissionRequest while blocked — the event loop must run in parallel.
+		sendDone := make(chan error, 1)
+		go func() {
+			if as == nil {
+				sendDone <- fmt.Errorf("agent session became nil")
+				return
+			}
+			sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		}()
+
+		turnResult := e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
+		if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
+			slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
-	}()
+		stopTyping = nil // ownership transferred; prevent defer from double-stopping
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, lockGen)
-	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
-		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
+		if !turnResult.quotaWall || failoverAttempted {
+			if turnResult.quotaWall && turnResult.err != nil {
+				e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), turnResult.err))
+			}
+			break
+		}
+
+		nextProvider, ok := e.interactiveFailoverProvider(agent)
+		if !ok {
+			if turnResult.err != nil {
+				e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), turnResult.err))
+			}
+			break
+		}
+		if err := e.restartInteractiveAgentForFailover(interactiveKey, state, session, sessions, agent, nextProvider); err != nil {
+			slog.Error("interactive provider failover restart failed", "session_key", interactiveKey,
+				"provider", nextProvider, "error", err)
+			if turnResult.err != nil {
+				e.send(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), turnResult.err))
+			}
+			break
+		}
+
+		failoverAttempted = true
+		e.send(p, msg.ReplyCtx, fmt.Sprintf("Claude provider quota reached; retrying this message with %s.", nextProvider))
+		if ti, ok := p.(TypingIndicator); ok {
+			stopTyping = ti.StartTyping(e.ctx, msg.ReplyCtx)
+		}
+		turnStart = time.Now()
 	}
-	stopTyping = nil // ownership transferred; prevent defer from double-stopping
 
 	// Start unsolicited reader and arm the idle close timer BEFORE draining
 	// queued messages. drainPendingMessages releases the session lock, and
@@ -4191,6 +4229,66 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	if e.drainPendingMessages(state, session, sessions, interactiveKey, lockGen) {
 		unlocked = true
 	}
+}
+
+func (e *Engine) interactiveFailoverProvider(agent Agent) (string, bool) {
+	if agent == nil || len(e.fallbackProviders) == 0 {
+		return "", false
+	}
+	ps, ok := agent.(ProviderSwitcher)
+	if !ok {
+		return "", false
+	}
+	current := ""
+	if active := ps.GetActiveProvider(); active != nil {
+		current = active.Name
+	}
+	if e.primaryProvider != "" && current != e.primaryProvider {
+		return "", false
+	}
+	for _, candidate := range e.fallbackProviders {
+		if candidate != "" && candidate != current {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func (e *Engine) restartInteractiveAgentForFailover(interactiveKey string, state *interactiveState, session *Session, sessions *SessionManager, agent Agent, provider string) error {
+	ps, ok := agent.(ProviderSwitcher)
+	if !ok || !ps.SetActiveProvider(provider) {
+		return fmt.Errorf("provider %q is not registered for agent", provider)
+	}
+
+	state.mu.Lock()
+	oldSession := state.agentSession
+	p := state.platform
+	replyCtx := state.replyCtx
+	state.agentSession = nil
+	state.eventsNeedResync = false
+	state.stopped = false
+	state.mu.Unlock()
+	if oldSession != nil {
+		e.closeAgentSessionWithTimeout(interactiveKey, oldSession, p, replyCtx)
+	}
+
+	session.SetAgentSessionID("", agent.Name())
+	session.SetActiveProvider(provider)
+	sessions.Save()
+	newSession, err := agent.StartSession(e.ctx, "")
+	if err != nil {
+		return err
+	}
+	state.mu.Lock()
+	state.agentSession = newSession
+	state.eventsNeedResync = false
+	state.stopped = false
+	state.mu.Unlock()
+	if newID := newSession.CurrentSessionID(); newID != "" {
+		session.SetAgentSessionID(newID, agent.Name())
+	}
+	sessions.Save()
+	return nil
 }
 
 // getOrCreateWorkspaceAgent returns (or creates) a per-workspace agent and session manager.
@@ -5267,7 +5365,7 @@ var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, lockGen uint64) (result interactiveTurnResult) {
 	if msgID != "" {
 		state.mu.Lock()
 		state.currentMessageID = msgID
@@ -5287,6 +5385,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var partialText string
 	triggerAutoCompress := false
 	pendingSend := sendDone
+	allowQuotaFailover := true
 
 	// stopTyping tracks the current turn's typing indicator so it can be
 	// stopped when a queued message starts a new turn.
@@ -6089,6 +6188,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
+			if allowQuotaFailover && replyAgent != nil {
+				if detector, ok := replyAgent.(InteractiveQuotaWallDetector); ok && detector.IsInteractiveQuotaWall(fullResponse) {
+					state.mu.Lock()
+					state.eventsNeedResync = true
+					state.mu.Unlock()
+					return interactiveTurnResult{quotaWall: true, err: fmt.Errorf("%s", fullResponse)}
+				}
+			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
 			// leak into the delivered text. The on-screen ctx indicator is now
@@ -6497,6 +6604,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 				state.mu.Unlock()
+				// A queued turn is already inside the current interactive drain;
+				// keep failover bounded to the originally submitted message.
+				allowQuotaFailover = false
 
 				// Stop the previous turn's typing indicator
 				if stopTyping != nil {
@@ -6661,6 +6771,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if event.Error != nil {
 				errMsg := event.Error.Error()
 				slog.Error("agent error", "error", event.Error)
+				if allowQuotaFailover && replyAgent != nil {
+					if detector, ok := replyAgent.(InteractiveQuotaWallDetector); ok && detector.IsInteractiveQuotaWall(errMsg) {
+						return interactiveTurnResult{quotaWall: true, err: event.Error}
+					}
+				}
 				e.hooks.Emit(HookEvent{
 					Event:      HookEventError,
 					SessionKey: sessionKey,
@@ -6692,6 +6807,12 @@ channelClosed:
 	state.mu.Lock()
 	state.eventsNeedResync = true
 	state.mu.Unlock()
+	if allowQuotaFailover && len(textParts) > 0 && replyAgent != nil {
+		fullResponse := strings.Join(textParts, "")
+		if detector, ok := replyAgent.(InteractiveQuotaWallDetector); ok && detector.IsInteractiveQuotaWall(fullResponse) {
+			return interactiveTurnResult{quotaWall: true, err: fmt.Errorf("%s", fullResponse)}
+		}
+	}
 	e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited"))
 	e.cleanupInteractiveState(sessionKey, state)
 
@@ -6750,6 +6871,7 @@ channelClosed:
 			}
 		}
 	}
+	return interactiveTurnResult{}
 }
 
 func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int) []ToolStep {
@@ -17710,4 +17832,3 @@ func quietSeparator(p Platform) string {
 	}
 	return "\n\n"
 }
-

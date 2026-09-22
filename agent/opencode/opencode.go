@@ -31,6 +31,7 @@ func init() {
 type Agent struct {
 	workDir              string
 	model                string
+	variant              string // provider-specific reasoning variant (e.g. high, xhigh)
 	mode                 string
 	cmd                  string   // CLI binary name, default "opencode"
 	cliExtraArgs         []string // extra args from cmd after the binary name
@@ -67,6 +68,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		workDir = "."
 	}
 	model, _ := opts["model"].(string)
+	variant, _ := opts["variant"].(string)
 	mode, _ := opts["mode"].(string)
 	mode = normalizeMode(mode)
 	cmd, extraArgs := core.ParseCmdOpts(opts, "opencode")
@@ -86,6 +88,7 @@ func New(opts map[string]any) (core.Agent, error) {
 	return &Agent{
 		workDir:              workDir,
 		model:                model,
+		variant:              variant,
 		mode:                 mode,
 		cmd:                  cmd,
 		cliExtraArgs:         extraArgs,
@@ -490,6 +493,7 @@ func (a *Agent) SetSessionEnv(env []string) {
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
 	model := a.model
+	variant := a.variant
 	mode := a.mode
 	cmd := a.cmd
 	extraArgs := append([]string{}, a.cliExtraArgs...)
@@ -505,7 +509,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
-	return newOpencodeSession(ctx, cmd, extraArgs, workDir, model, mode, agentName, sessionID, extraEnv)
+	return newOpencodeSession(ctx, cmd, extraArgs, workDir, model, mode, agentName, sessionID, extraEnv, variant)
 }
 
 // ListSessions runs `opencode session list` and parses the JSON output.

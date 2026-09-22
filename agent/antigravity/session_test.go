@@ -90,6 +90,9 @@ func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
 	if !contains(args, "--verbose") {
 		t.Fatalf("expected configured extra args, got: %v", args)
 	}
+	if !contains(args, "--add-dir") || !contains(args, "/tmp") {
+		t.Fatalf("expected configured workspace in args, got: %v", args)
+	}
 	if contains(args, "-m") || contains(args, "--model") {
 		t.Fatalf("did not expect model flags in args, got: %v", args)
 	}

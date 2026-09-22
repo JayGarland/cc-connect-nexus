@@ -194,6 +194,12 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	// Prepend extra args from cmd so wrappers like "timeout 3600 agy" work.
 	// Keep "-p <prompt>" at the very end because agy consumes the immediate next arg.
 	args := append([]string{}, as.extraArgs...)
+	// agy does not promote its inherited cwd to an active workspace in print
+	// mode. Pass the configured directory explicitly so fresh and resumed
+	// Telegram turns operate on the intended project rather than scratch.
+	if strings.TrimSpace(as.workDir) != "" {
+		args = append(args, "--add-dir", as.workDir)
+	}
 	if agyConfigDir != "" {
 		// Antigravity currently names this compatibility flag --gemini_dir.
 		args = append(args, "--gemini_dir="+agyConfigDir, "--print-timeout=24h")

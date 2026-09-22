@@ -14,6 +14,8 @@ var sessionLimitPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)you'?ve hit your session limit`),
 	regexp.MustCompile(`(?i)you have hit your session limit`),
 	regexp.MustCompile(`(?i)session limit reached`),
+	regexp.MustCompile(`(?i)you'?ve hit your monthly spend limit`),
+	regexp.MustCompile(`(?i)monthly spend limit`),
 }
 
 // NexusCronRecoveryDecider implements core.CronRecoveryDecider for Claude Code.

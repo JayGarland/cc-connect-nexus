@@ -417,6 +417,14 @@ type ProviderSwitcher interface {
 	ListProviders() []ProviderConfig
 }
 
+// InteractiveQuotaWallDetector identifies an agent-specific provider quota
+// failure from the error emitted at the end of an interactive turn. The
+// engine uses this optional capability for bounded provider failover without
+// embedding provider-specific error text in core.
+type InteractiveQuotaWallDetector interface {
+	IsInteractiveQuotaWall(errorText string) bool
+}
+
 // MemoryFileProvider is an optional interface for agents that support
 // persistent instruction files (CLAUDE.md, AGENTS.md, GEMINI.md, etc.).
 // The engine uses these paths for the /memory command.
@@ -697,4 +705,3 @@ type PreviewStatusUpdater interface {
 type QuietSeparatorProvider interface {
 	QuietSeparator() string
 }
-
