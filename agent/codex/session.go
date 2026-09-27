@@ -390,6 +390,11 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 	case <-readDone:
 		// Normal path: stdout hit EOF on its own.
 	case <-cs.ctx.Done():
+		// Session closed mid-turn. The kill is already in flight
+		// (CommandContext), but Close() must not return while the child
+		// is still being reaped — it runs with workDir as cwd, and an
+		// unreaped child keeps that directory locked.
+		<-waitDone
 		return
 	case <-waitDone:
 		// codex.exe itself has already exited. Give already-buffered output a
