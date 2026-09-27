@@ -961,6 +961,26 @@ func TestCodexSession_ContinueSessionTreatedAsFresh(t *testing.T) {
 	}
 }
 
+// drainStartupSessionEvent consumes the session-ID text event upstream now
+// emits on thread.started (so Engine can persist the binding before the
+// first turn completes). Tests asserting on the terminal event call this
+// first; without it they would read the startup event instead.
+func drainStartupSessionEvent(t *testing.T, cs *codexSession, wantThreadID string) {
+	t.Helper()
+	timeout := time.After(5 * time.Second)
+	select {
+	case evt, ok := <-cs.Events():
+		if !ok {
+			t.Fatal("events channel closed unexpectedly")
+		}
+		if evt.Type != core.EventText || evt.SessionID != wantThreadID {
+			t.Fatalf("expected startup session ID event for %q, got %+v", wantThreadID, evt)
+		}
+	case <-timeout:
+		t.Fatal("timed out waiting for startup session ID event")
+	}
+}
+
 func TestReadLoop_ChildHoldsStdoutPipe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1007,6 +1027,8 @@ func TestReadLoop_ChildHoldsStdoutPipe(t *testing.T) {
 	if cs.CurrentSessionID() != "test-pipe" {
 		t.Fatal("timed out receiving thread.started")
 	}
+
+	drainStartupSessionEvent(t, cs, "test-pipe")
 
 	select {
 	case evt := <-cs.events:
@@ -1308,6 +1330,8 @@ Start-Sleep -Milliseconds 300
 		t.Fatalf("Send: %v", err)
 	}
 
+	drainStartupSessionEvent(t, cs, "thread-delay-exit")
+
 	timeout := time.After(5 * time.Second)
 	select {
 	case evt, ok := <-cs.Events():
@@ -1356,6 +1380,8 @@ exit 0
 	if err := cs.Send("hello", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
+
+	drainStartupSessionEvent(t, cs, "thread-fail")
 
 	var events []core.Event
 	timeout := time.After(5 * time.Second)
@@ -1419,6 +1445,8 @@ exit 1
 	if err := cs.Send("hello", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
+
+	drainStartupSessionEvent(t, cs, "thread-crash")
 
 	timeout := time.After(5 * time.Second)
 	select {
@@ -1508,6 +1536,8 @@ exit 0
 		t.Fatalf("Send: %v", err)
 	}
 
+	drainStartupSessionEvent(t, cs, "thread-clean-no-term")
+
 	timeout := time.After(5 * time.Second)
 	select {
 	case evt, ok := <-cs.Events():
@@ -1554,6 +1584,8 @@ exit 1
 	if err := cs.Send("hello", "", nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
+
+	drainStartupSessionEvent(t, cs, "thread-completed-nonzero")
 
 	timeout := time.After(5 * time.Second)
 	var gotError bool
